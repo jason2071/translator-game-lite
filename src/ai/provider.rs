@@ -354,10 +354,14 @@ pub fn parse_content(content: &str) -> Result<TranslationResponse> {
         let text = item
             .get("text")
             .and_then(|v| v.as_str())
+            // Models often answer with leading/trailing spaces, doubled
+            // spaces or invisible filler characters — normalize so list
+            // rendering stays left-aligned.
+            .map(crate::core::source::clean_spaces)
             .ok_or_else(|| anyhow!("a translation item is missing its text"))?;
         out.translations.push(TranslatedItem {
             id: id.to_string(),
-            text: text.to_string(),
+            text,
         });
     }
     Ok(out)

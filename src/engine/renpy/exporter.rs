@@ -225,7 +225,9 @@ fn export_in_place(game_root: &Path, translations: &[&TranslationEntry]) -> Resu
                 continue;
             };
             let trimmed = raw.trim_start();
-            let translated = t.translated_text.as_deref().unwrap_or("");
+            // Normalize stray spaces so game files stay clean.
+            let translated =
+                &crate::core::source::clean_spaces(t.translated_text.as_deref().unwrap_or(""));
             let original = t.source.source_text.as_str();
 
             if keyword_string(trimmed, "old").as_deref() == Some(original) {

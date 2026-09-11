@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, LogicalPosition, ModelRc, SharedString, VecModel, WindowPosition};
 
 use crate::ai::{OpenAiCompatibleProvider, ProviderConfig, TranslationProvider as _};
 use crate::core::context::ContextWindow;
@@ -38,6 +38,8 @@ pub fn run(db: Arc<Db>) -> Result<()> {
     let editor = ProfileEditorWindow::new()?;
     let cancel = Arc::new(AtomicBool::new(false));
 
+    // Repair stray spaces older runs may have saved.
+    let _ = db.cleanup_translations();
     load_settings(&app, &db);
     if let Some(project) = current_project(&db) {
         apply_project(&app, &project);
@@ -94,7 +96,13 @@ fn refresh_entries(ui: &AppWindow, db: &Db, project: &Project) {
         .map(|e| EntryRow {
             id: e.source.id.into(),
             original: e.source.source_text.into(),
-            translation: e.translated_text.unwrap_or_default().into(),
+            // Older rows may contain stray spaces from early runs —
+            // normalize for display.
+            translation: e
+                .translated_text
+                .map(|t| crate::core::source::clean_spaces(&t))
+                .unwrap_or_default()
+                .into(),
             speaker: e.source.speaker.unwrap_or_default().into(),
             status: e.status.as_str().into(),
             file: format!("{}:{}", e.source.file_path, e.source.line).into(),
@@ -125,7 +133,11 @@ fn load_entry_detail(ui: &AppWindow, db: &Db, id: &str) {
     ui.set_sel_id(id.into());
     ui.set_sel_original(entry.source.source_text.clone().into());
     ui.set_sel_status(entry.status.as_str().into());
-    ui.set_sel_translation(entry.translated_text.clone().unwrap_or_default().into());
+    // Normalize stray spaces so the editor matches the cleaned list view.
+    let translation = entry
+        .translated_text
+        .map(|t| crate::core::source::clean_spaces(&t));
+    ui.set_sel_translation(translation.unwrap_or_default().into());
 
     let window = context_window(db);
     let (previous, next) = db
@@ -357,6 +369,21 @@ fn refresh_profile_pickers(ui: &AppWindow, db: &Db) {
     ui.set_glossary_profile_index(index_for(crate::database::PURPOSE_GLOSSARY));
 }
 
+/// Open the profile editor centered over the main window.
+fn show_editor_centered(app: &AppWindow, editor: &ProfileEditorWindow) {
+    let scale = app.window().scale_factor();
+    let size = app.window().size();
+    let pos = app.window().position();
+    let logical_w = size.width as f32 / scale;
+    let logical_h = size.height as f32 / scale;
+    let x = pos.x as f32 / scale + ((logical_w - 780.0) / 2.0).max(0.0);
+    let y = pos.y as f32 / scale + ((logical_h - 560.0) / 2.0).max(0.0);
+    editor
+        .window()
+        .set_position(WindowPosition::Logical(LogicalPosition::new(x, y)));
+    let _ = editor.show();
+}
+
 fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc<Db>) {
     // Shared state: which profile the editor modal is working on
     // (None = creating a new one).
@@ -367,6 +394,14 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
         let weak = ui.as_weak();
         let db = db.clone();
         ui.on_profile_delete(move |id| {
+            let confirmed = rfd::MessageDialog::new()
+                .set_title("Delete profile")
+                .set_description("Delete this AI profile? The pages using it will fall back to another profile.")
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if confirmed != rfd::MessageDialogResult::Yes {
+                return;
+            }
             let _ = db.ai_profile_delete(&id);
             // Repoint any purpose that referenced the deleted profile.
             let remaining = db.ai_profile_list().unwrap_or_default();
@@ -389,6 +424,7 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
         });
     }
     {
+        let app_weak = ui.as_weak();
         let editor_weak = editor.as_weak();
         let db = db.clone();
         let editing_weak = Arc::clone(&editing);
@@ -416,10 +452,13 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
             editor.set_ed_temperature("0.3".into());
             editor.set_error(String::new().into());
             *editing_weak.lock().unwrap() = None;
-            let _ = editor.show();
+            if let Some(app) = app_weak.upgrade() {
+                show_editor_centered(&app, &editor);
+            }
         });
     }
     {
+        let app_weak = ui.as_weak();
         let editor_weak = editor.as_weak();
         let db = db.clone();
         let editing_weak = Arc::clone(&editing);
@@ -443,7 +482,9 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
             editor.set_ed_temperature(format!("{:.2}", p.temperature).into());
             editor.set_error(String::new().into());
             *editing_weak.lock().unwrap() = Some(p.id.clone());
-            let _ = editor.show();
+            if let Some(app) = app_weak.upgrade() {
+                show_editor_centered(&app, &editor);
+            }
         });
     }
 
@@ -808,6 +849,17 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         ui.on_select_entry(move |id| {
             let Some(ui) = weak.upgrade() else { return };
             load_entry_detail(&ui, &db, &id);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_close_editor(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_sel_id("".into());
+            ui.set_sel_original("".into());
+            ui.set_sel_translation("".into());
+            ui.set_sel_glossary_hint("".into());
+            ui.set_sel_status("".into());
         });
     }
     {

@@ -27,6 +27,28 @@ pub fn hash_text(text: &str) -> String {
     hex
 }
 
+/// Remove space-like/invisible characters some models emit (zero-width
+/// spaces, fillers, NBSP, soft hyphens, ...) and collapse whitespace runs.
+/// Keeps list rendering left-aligned and game exports clean.
+pub fn clean_spaces(text: &str) -> String {
+    let mapped: String = text
+        .chars()
+        .map(|c| {
+            if matches!(
+                c,
+                '\u{00a0}' | '\u{00ad}' | '\u{180e}' | '\u{2000}'..='\u{200f}'
+                    | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{2800}'
+                    | '\u{3000}' | '\u{3164}' | '\u{feff}'
+            ) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    mapped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +67,14 @@ mod tests {
             a,
             "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969"
         );
+    }
+
+    #[test]
+    fn clean_spaces_trims_and_collapses() {
+        assert_eq!(clean_spaces("  สวัสดี   ครับ  "), "สวัสดี ครับ");
+        assert_eq!(clean_spaces("a\u{00a0}b"), "a b");
+        assert_eq!(clean_spaces("a\u{200b}b"), "a b");
+        assert_eq!(clean_spaces("\u{feff}สวัสดี"), "สวัสดี");
+        assert_eq!(clean_spaces("ok"), "ok");
     }
 }

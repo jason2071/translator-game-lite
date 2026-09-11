@@ -76,22 +76,26 @@ component FieldLabel inherits Text {
     color: #777;
 }
 
-/// Square icon button (used for the model-list refresh).
+/// Square icon button (refresh, close, add, edit, delete, ...).
 component IconButton inherits Rectangle {
+    in property <image> source;
     callback clicked();
     border-radius: 6px;
     background: ta.has-hover ? #e4e8f2 : transparent;
-    min-width: 34px;
-    max-width: 34px;
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
     horizontal-stretch: 0;
+    vertical-stretch: 0;
     ta := TouchArea {
         clicked => { root.clicked(); }
         mouse-cursor: pointer;
     }
     Image {
-        source: @image-url("assets/refresh.svg");
-        width: 18px;
-        height: 18px;
+        source: root.source;
+        width: 16px;
+        height: 16px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
     }
@@ -133,7 +137,7 @@ component NavItem inherits Rectangle {
 // ============================================================ main window
 
 export component AppWindow inherits Window {
-    title: "Game Translator";
+    title: "Game Translator v0.1";
     icon: @image-url("assets/app-icon.png");
     preferred-width: 1180px;
     preferred-height: 720px;
@@ -216,6 +220,7 @@ export component AppWindow inherits Window {
     callback save-context-before(string);
     callback save-context-after(string);
     callback save-prompt(string);
+    callback close-editor();
 
     VerticalLayout {
         // ================================================== header / toolbar
@@ -271,7 +276,7 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         horizontal-stretch: 3;
                         spacing: 6px;
-                        Rectangle {
+                        header := Rectangle {
                             height: 30px;
                             background: #eef0f5;
                             border-radius: 4px;
@@ -285,40 +290,65 @@ export component AppWindow inherits Window {
                         }
                         ListView {
                             vertical-stretch: 1;
-                            for row in root.entries: Rectangle {
-                                height: 34px;
-                                background: row.id == root.sel-id ? #e3ecff : (row.status == "failed" ? #fff3f3 : white);
-                                TouchArea {
-                                    clicked => { root.select-entry(row.id); }
-                                }
-                                HorizontalLayout {
-                                    padding-left: 10px;
-                                    padding-right: 10px;
+                            // DEBUG MODE still on: row zebra + column colors.
+                            // Texts are anchored INSIDE their own column box
+                            // (absolute position) so they cannot shift.
+                            for row[idx] in root.entries: rowrect := Rectangle {
+                                height: 38px;
+                                background: Math.mod(idx, 2) == 0 ? #ffe3e3 : #e3f0ff;
+                                // column width, shared by the three columns
+                                property <length> colw: (rowrect.width - 20px - 90px) / 2;
+
+                                Rectangle { // Original column
+                                    x: 10px;
+                                    y: 0;
+                                    width: rowrect.colw;
+                                    height: parent.height;
+                                    background: #d9f2d9;
                                     Text {
+                                        width: parent.width;
+                                        height: parent.height;
                                         text: row.original;
-                                        horizontal-stretch: 1;
-                                        overflow: elide;
                                         vertical-alignment: center;
+                                        horizontal-alignment: left;
+                                        overflow: elide;
                                         color: #222;
                                     }
+                                }
+                                Rectangle { // Translation column
+                                    x: 10px + rowrect.colw;
+                                    y: 0;
+                                    width: rowrect.colw;
+                                    height: parent.height;
+                                    background: #fff3c4;
                                     Text {
+                                        width: parent.width;
+                                        height: parent.height;
                                         text: row.translation;
-                                        horizontal-stretch: 1;
-                                        overflow: elide;
                                         vertical-alignment: center;
-                                        color: row.status == "failed" ? #c62828 : #111;
+                                        horizontal-alignment: left;
+                                        overflow: elide;
+                                        color: #111;
                                     }
-                                    Rectangle {
-                                        width: 90px;
-                                        Text {
-                                            text: row.status == "" ? "pending" : row.status;
-                                            font-size: 11px;
-                                            color: row.status == "translated" ? #1a7f37
-                                                 : row.status == "edited" ? #1c5fd6
-                                                 : row.status == "failed" ? #c62828 : #999;
-                                            vertical-alignment: center;
-                                        }
+                                }
+                                Rectangle { // Status column
+                                    x: 10px + rowrect.colw * 2;
+                                    y: 0;
+                                    width: 90px;
+                                    height: parent.height;
+                                    background: #ece0ff;
+                                    Text {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text: row.status == "" ? "pending" : row.status;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: left;
+                                        color: #555;
                                     }
+                                }
+                                TouchArea {
+                                    clicked => { root.select-entry(row.id); }
                                 }
                             }
                         }
@@ -348,7 +378,15 @@ export component AppWindow inherits Window {
                                 padding: 12px;
                                 spacing: 8px;
 
-                                FieldLabel { text: "ORIGINAL"; }
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        FieldLabel { text: "ORIGINAL"; vertical-alignment: center; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        IconButton {
+                                            source: @image-url("assets/x.svg");
+                                            clicked => { root.close-editor(); }
+                                        }
+                                    }
                                 Rectangle {
                                     background: #f7f8fa;
                                     border-radius: 6px;
@@ -423,7 +461,7 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                     ComboBox {
-                        width: 250px;
+                        width: 180px;
                         model: root.translation-profile-items;
                         current-index <=> root.translation-profile-index;
                         selected(text) => { root.pick-translation-profile(text); }
@@ -469,13 +507,16 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                     ComboBox {
-                        width: 250px;
+                        width: 200px;
                         model: root.glossary-profile-items;
                         current-index <=> root.glossary-profile-index;
                         selected(text) => { root.pick-glossary-profile(text); }
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    Button { text: "+ Add"; clicked => { root.glossary-new(); } }
+                    IconButton {
+                        source: @image-url("assets/plus.svg");
+                        clicked => { root.glossary-new(); }
+                    }
                 }
 
                 HorizontalLayout {
@@ -500,7 +541,7 @@ export component AppWindow inherits Window {
                         Text { text: "Translation"; width: 220px; font-weight: 600; vertical-alignment: center; }
                         Text { text: "Note"; font-weight: 600; vertical-alignment: center; }
                         Text { text: "On"; width: 40px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                        Text { text: ""; width: 150px; }
+                        Text { text: ""; width: 110px; }
                     }
                 }
                 ListView {
@@ -519,11 +560,18 @@ export component AppWindow inherits Window {
                                 toggled => { root.glossary-toggle(g.id, self.checked); }
                             }
                             Rectangle {
-                                width: 150px;
+                                width: 110px;
                                 HorizontalLayout {
+                                    alignment: center;
                                     spacing: 4px;
-                                    Button { text: "Edit"; clicked => { root.glossary-load(g.id); } }
-                                    Button { text: "Del"; clicked => { root.glossary-delete(g.id); } }
+                                    IconButton {
+                                        source: @image-url("assets/edit.svg");
+                                        clicked => { root.glossary-load(g.id); }
+                                    }
+                                    IconButton {
+                                        source: @image-url("assets/trash.svg");
+                                        clicked => { root.glossary-delete(g.id); }
+                                    }
                                 }
                             }
                         }
@@ -565,7 +613,10 @@ export component AppWindow inherits Window {
                     ScrollView {
                         vertical-stretch: 1;
 
-                        if root.section == 0 : SectionCard {
+                        VerticalLayout {
+                            spacing: 10px;
+
+                            if root.section == 0 : SectionCard {
                             VerticalLayout {
                                 padding: 14px;
                                 spacing: 8px;
@@ -579,7 +630,10 @@ export component AppWindow inherits Window {
                                         color: #999;
                                         vertical-alignment: center;
                                     }
-                                    Button { text: "+ Add Profile"; clicked => { root.profile-add(); } }
+                                    IconButton {
+                                        source: @image-url("assets/plus.svg");
+                                        clicked => { root.profile-add(); }
+                                    }
                                 }
 
                                 Rectangle {
@@ -628,11 +682,18 @@ export component AppWindow inherits Window {
                                                 color: #888;
                                             }
                                             Rectangle {
-                                                width: 132px;
+                                                width: 90px;
                                                 HorizontalLayout {
+                                                    alignment: center;
                                                     spacing: 4px;
-                                                    Button { text: "Edit"; clicked => { root.profile-edit(p.id); } }
-                                                    Button { text: "Del"; clicked => { root.profile-delete(p.id); } }
+                                                    IconButton {
+                                                        source: @image-url("assets/edit.svg");
+                                                        clicked => { root.profile-edit(p.id); }
+                                                    }
+                                                    IconButton {
+                                                        source: @image-url("assets/trash.svg");
+                                                        clicked => { root.profile-delete(p.id); }
+                                                    }
                                                 }
                                             }
                                         }
@@ -750,6 +811,9 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+
+                        Rectangle { vertical-stretch: 1; }
+                        }
                     }
                 }
             }
@@ -778,8 +842,8 @@ export component AppWindow inherits Window {
 export component ProfileEditorWindow inherits Window {
     title: "AI Profile";
     icon: @image-url("assets/app-icon.png");
-    preferred-width: 560px;
-    preferred-height: 470px;
+    width: 780px;
+    height: 560px;
     background: white;
 
     in-out property <string> ed-name;
@@ -812,7 +876,7 @@ export component ProfileEditorWindow inherits Window {
             }
             VerticalLayout {
                 spacing: 2px;
-                width: 200px;
+                width: 170px;
                 FieldLabel { text: "Preset"; }
                 ComboBox {
                     model: ["OpenAI (cloud)", "Ollama Cloud (API key)", "Ollama (local)", "LM Studio (local)", "OpenRouter", "Custom"];
@@ -848,14 +912,15 @@ export component ProfileEditorWindow inherits Window {
                         current-index <=> root.ed-model-index;
                         selected(text) => { root.ed-apply-model(text); }
                     }
-                    IconButton {
-                        clicked => { root.ed-refresh-models(); }
-                    }
+                                    IconButton {
+                                        source: @image-url("assets/refresh.svg");
+                                        clicked => { root.ed-refresh-models(); }
+                                    }
                 }
             }
             VerticalLayout {
                 spacing: 2px;
-                width: 120px;
+                width: 110px;
                 FieldLabel { text: "Temperature"; }
                 LineEdit {
                     text <=> root.ed-temperature;

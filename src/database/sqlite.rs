@@ -592,7 +592,30 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM ai_profiles WHERE id = ?1", params![id])?;
         Ok(())
-	}
+    }
+
+    /// One-time-per-launch cleanup: normalize whitespace in stored
+    /// translations (older runs could save stray/filler spaces).
+    pub fn cleanup_translations(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_id, translated_text FROM translations WHERE translated_text IS NOT NULL",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (id, text) in rows {
+            let clean = crate::core::source::clean_spaces(&text);
+            if clean != text {
+                conn.execute(
+                    "UPDATE translations SET translated_text = ?2 WHERE source_id = ?1",
+                    params![id, clean],
+                )?;
+            }
+        }
+        Ok(())
+    }
 
     /// First-run migration: with no profiles saved, turn the legacy flat
     /// settings (api_endpoint/api_key/model) into a "Default" profile and
