@@ -1,0 +1,21 @@
+# Rust build artifacts
+target/
+
+# Logs
+*.log
+
+# Local environment / secrets (API keys live in the app's local DB, not here)
+.env
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor junk
+*.rs.bk

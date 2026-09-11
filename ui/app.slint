@@ -1,0 +1,597 @@
+import { Button, LineEdit, CheckBox, ComboBox, ListView, ScrollView, TextEdit } from "std-widgets.slint";
+
+component ProgressBar inherits Rectangle {
+    in property <float> progress; // 0..1
+    background: #e4e6ec;
+    border-radius: 4px;
+    Rectangle {
+        x: 0;
+        y: 0;
+        height: parent.height;
+        width: parent.width * clamp(parent.progress, 0, 1);
+        background: #1c5fd6;
+        border-radius: 4px;
+    }
+}
+
+export struct EntryRow {
+    id: string,
+    original: string,
+    translation: string,
+    speaker: string,
+    status: string,
+    file: string,
+}
+
+export struct GlossaryRow {
+    id: string,
+    source: string,
+    target: string,
+    note: string,
+    enabled: bool,
+}
+
+export struct ContextInfo {
+    speaker: string,
+    scene: string,
+    previous: string,
+    next: string,
+}
+
+component StatBox inherits Rectangle {
+    in property <string> label;
+    in property <int> value;
+    in property <color> accent;
+    border-radius: 8px;
+    background: #f5f6fa;
+    min-height: 58px;
+    VerticalLayout {
+        padding: 10px;
+        alignment: center;
+        Text {
+            text: "\{root.value}";
+            font-size: 22px;
+            font-weight: 700;
+            color: root.accent;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: #666;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+component FieldLabel inherits Text {
+    font-size: 11px;
+    color: #777;
+}
+
+/// Square icon button (used for the model-list refresh).
+component IconButton inherits Rectangle {
+    callback clicked();
+    border-radius: 6px;
+    background: ta.has-hover ? #e4e8f2 : transparent;
+    min-width: 34px;
+    max-width: 34px;
+    horizontal-stretch: 0;
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+    Image {
+        source: @image-url("assets/refresh.svg");
+        width: 18px;
+        height: 18px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+}
+
+component NavButton inherits Button {
+}
+
+export component AppWindow inherits Window {
+    title: "Game Translator";
+    preferred-width: 1180px;
+    preferred-height: 720px;
+    background: white;
+
+    // ---- navigation
+    in-out property <int> current-tab; // 0 = project, 1 = glossary, 2 = settings
+
+    // ---- project
+    in-out property <string> project-path;
+    in property <string> engine-name;
+    in property <int> stat-total;
+    in property <int> stat-translated;
+    in property <int> stat-pending;
+    in property <int> stat-failed;
+
+    // ---- entries
+    in property <[EntryRow]> entries;
+    in property <int> page;          // 0-based
+    in property <int> page-count;
+    in-out property <string> sel-id;
+    in property <string> sel-original;
+    in property <string> sel-status;
+    in-out property <string> sel-translation;
+    in property <string> sel-glossary-hint;
+    in property <ContextInfo> sel-context;
+
+    // ---- glossary
+    in property <[GlossaryRow]> glossary;
+    in-out property <string> glossary-search;
+    in-out property <string> gl-id;
+    in-out property <string> gl-source;
+    in-out property <string> gl-target;
+    in-out property <string> gl-note;
+
+    // ---- settings
+    in-out property <int> provider-preset;
+    in-out property <string> set-endpoint;
+    in property <[string]> model-items;
+    in-out property <int> model-index;
+    in-out property <string> set-api-key;
+    in-out property <string> set-model;
+    in-out property <string> set-source-lang;
+    in-out property <string> set-target-lang;
+    in-out property <string> set-batch-size;
+    in-out property <string> set-concurrency;
+    in-out property <string> set-context-before;
+    in-out property <string> set-context-after;
+    in-out property <string> set-prompt;
+
+    // ---- worker state
+    in property <bool> running;
+    in property <float> progress; // 0..1
+    in-out property <string> status-message;
+
+    callback browse-project();
+    callback scan-project();
+    callback start-translate();
+    callback cancel-translate();
+    callback do-export();
+    callback prev-page();
+    callback next-page();
+    callback select-entry(string);
+    callback save-edit();
+    callback retranslate-entry();
+    callback glossary-new();
+    callback glossary-load(string);
+    callback glossary-save();
+    callback glossary-delete(string);
+    callback glossary-toggle(string, bool);
+    callback apply-glossary-search(string);
+    callback save-settings();
+    callback apply-provider-preset(string);
+    callback refresh-models();
+    callback apply-model(string);
+
+    VerticalLayout {
+        // ================================================== header / toolbar
+        HorizontalLayout {
+            padding: 10px;
+            spacing: 8px;
+            Text {
+                text: "Game Translator";
+                font-size: 17px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            LineEdit {
+                text <=> root.project-path;
+                read-only: true;
+                min-width: 260px;
+            }
+            Button { text: "Open..."; clicked => { root.browse-project(); } }
+            Button { text: "Scan"; enabled: root.project-path != ""; clicked => { root.scan-project(); } }
+            Rectangle { horizontal-stretch: 1; }
+            for t[idx] in [
+                { name: "Project" }, { name: "Glossary" }, { name: "Settings" },
+            ] : NavButton {
+                text: t.name;
+                clicked => { root.current-tab = idx; }
+            }
+        }
+
+        // ================================================== content
+        Rectangle {
+            vertical-stretch: 1;
+
+            if root.current-tab == 0 : VerticalLayout {
+                // ------------------------------------------------- stats
+                HorizontalLayout {
+                    padding: 10px;
+                    spacing: 10px;
+                    StatBox { label: "Total"; value: root.stat-total; accent: #333; }
+                    StatBox { label: "Translated"; value: root.stat-translated; accent: #1a7f37; }
+                    StatBox { label: "Pending"; value: root.stat-pending; accent: #b58900; }
+                    StatBox { label: "Failed"; value: root.stat-failed; accent: #c62828; }
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: "Engine: " + (root.engine-name == "" ? "—" : root.engine-name); color: #666; }
+                    }
+                }
+
+                // --------------------------------- table + editor panel
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 10px;
+                    vertical-stretch: 1;
+
+                    // ---- entry table
+                    VerticalLayout {
+                        horizontal-stretch: 3;
+                        spacing: 6px;
+                        Rectangle {
+                            height: 30px;
+                            background: #eef0f5;
+                            border-radius: 4px;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                Text { text: "Original"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                Text { text: "Translation"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                Text { text: "Status"; width: 90px; font-weight: 600; vertical-alignment: center; }
+                            }
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for row in root.entries: Rectangle {
+                                height: 34px;
+                                background: row.id == root.sel-id ? #e3ecff : (row.status == "failed" ? #fff3f3 : white);
+                                TouchArea {
+                                    clicked => { root.select-entry(row.id); }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    Text {
+                                        text: row.original;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                        color: #222;
+                                    }
+                                    Text {
+                                        text: row.translation;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                        color: row.status == "failed" ? #c62828 : #111;
+                                    }
+                                    Rectangle {
+                                        width: 90px;
+                                        Text {
+                                            text: row.status == "" ? "pending" : row.status;
+                                            font-size: 11px;
+                                            color: row.status == "translated" ? #1a7f37
+                                                 : row.status == "edited" ? #1c5fd6
+                                                 : row.status == "failed" ? #c62828 : #999;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 10px;
+                            Button { text: "◀ Prev"; enabled: root.page > 0; clicked => { root.prev-page(); } }
+                            Text {
+                                text: "Page " + (root.page + 1) + " / " + root.page-count;
+                                vertical-alignment: center;
+                                color: #555;
+                            }
+                            Button { text: "Next ▶"; enabled: root.page < root.page-count - 1; clicked => { root.next-page(); } }
+                        }
+                    }
+
+                    // ---- editor panel
+                    if root.sel-id != "" : VerticalLayout {
+                        width: 380px;
+                        spacing: 8px;
+                        Rectangle {
+                            clip: true;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: #e2e4ea;
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 8px;
+
+                                FieldLabel { text: "ORIGINAL"; }
+                                Rectangle {
+                                    background: #f7f8fa;
+                                    border-radius: 6px;
+                                    min-height: 56px;
+                                    max-height: 90px;
+                                    ScrollView {
+                                        Text {
+                                            text: root.sel-original;
+                                            wrap: word-wrap;
+                                            font-size: 13px;
+                                            color: #222;
+                                        }
+                                    }
+                                }
+
+                                FieldLabel { text: "CONTEXT"; }
+                                Rectangle {
+                                    background: #f7f8fa;
+                                    border-radius: 6px;
+                                    VerticalLayout {
+                                        padding: 8px;
+                                        spacing: 4px;
+                                        if root.sel-context.speaker != "" : Text { text: "Speaker: " + root.sel-context.speaker; font-size: 12px; color: #444; }
+                                        if root.sel-context.scene != "" : Text { text: "Scene: " + root.sel-context.scene; font-size: 12px; color: #444; }
+                                        if root.sel-context.previous != "" : Text { text: "Previous: " + root.sel-context.previous; font-size: 12px; color: #666; wrap: word-wrap; }
+                                        Text { text: "Current: " + root.sel-original; font-size: 12px; color: #111; font-weight: 600; wrap: word-wrap; }
+                                        if root.sel-context.next != "" : Text { text: "Next: " + root.sel-context.next; font-size: 12px; color: #666; wrap: word-wrap; }
+                                    }
+                                }
+
+                                if root.sel-glossary-hint != "" : FieldLabel { text: "GLOSSARY"; }
+                                if root.sel-glossary-hint != "" : Text {
+                                    text: root.sel-glossary-hint;
+                                    font-size: 12px;
+                                    color: #8a5a00;
+                                    wrap: word-wrap;
+                                }
+
+                                FieldLabel { text: "TRANSLATION  (status: " + root.sel-status + ")"; }
+                                Rectangle {
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: #d5d8e0;
+                                    min-height: 90px;
+                                    TextEdit {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text <=> root.sel-translation;
+                                        font-size: 13px;
+                                        wrap: word-wrap;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Button { text: "Save"; clicked => { root.save-edit(); } }
+                                    Button { text: "Re-translate"; enabled: !root.running; clicked => { root.retranslate-entry(); } }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------------ bottom bar
+                HorizontalLayout {
+                    padding: 10px;
+                    spacing: 10px;
+                    if !root.running : Button {
+                        text: "Translate pending";
+                        primary: true;
+                        enabled: root.project-path != "";
+                        clicked => { root.start-translate(); }
+                    }
+                    if root.running : Button {
+                        text: "Cancel";
+                        clicked => { root.cancel-translate(); }
+                    }
+                    ProgressBar {
+                        horizontal-stretch: 1;
+                        progress: root.progress;
+                    }
+                    Button {
+                        text: "Export";
+                        enabled: root.project-path != "" && !root.running;
+                        clicked => { root.do-export(); }
+                    }
+                }
+            }
+
+            if root.current-tab == 1 : VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        placeholder-text: "Search glossary...";
+                        text <=> root.glossary-search;
+                        min-width: 240px;
+                        edited(text) => { root.apply-glossary-search(text); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "+ Add"; clicked => { root.glossary-new(); } }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit { placeholder-text: "Source term"; text <=> root.gl-source; min-width: 200px; }
+                    LineEdit { placeholder-text: "Translation"; text <=> root.gl-target; min-width: 200px; }
+                    LineEdit { placeholder-text: "Note (optional)"; text <=> root.gl-note; }
+                    Button {
+                        text: root.gl-id == "" ? "Add" : "Update";
+                        clicked => { root.glossary-save(); }
+                    }
+                }
+
+                // header
+                Rectangle {
+                    height: 26px;
+                    background: #eef0f5;
+                    border-radius: 4px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        Text { text: "Source"; width: 200px; font-weight: 600; vertical-alignment: center; }
+                        Text { text: "Translation"; width: 220px; font-weight: 600; vertical-alignment: center; }
+                        Text { text: "Note"; font-weight: 600; vertical-alignment: center; }
+                        Text { text: "On"; width: 40px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: ""; width: 150px; }
+                    }
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for g in root.glossary: Rectangle {
+                        height: 32px;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            spacing: 4px;
+                            Text { text: g.source; width: 200px; vertical-alignment: center; }
+                            Text { text: g.target; width: 220px; vertical-alignment: center; }
+                            Text { text: g.note; overflow: elide; vertical-alignment: center; color: #666; }
+                            CheckBox {
+                                width: 40px;
+                                checked: g.enabled;
+                                toggled => { root.glossary-toggle(g.id, self.checked); }
+                            }
+                            Rectangle {
+                                width: 150px;
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    Button { text: "Edit"; clicked => { root.glossary-load(g.id); } }
+                                    Button { text: "Del"; clicked => { root.glossary-delete(g.id); } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.current-tab == 2 : ScrollView {
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 8px;
+                    Text { text: "AI Provider"; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            spacing: 2px;
+                            FieldLabel { text: "Provider Preset"; }
+                            ComboBox {
+                                model: ["OpenAI (cloud)", "Ollama Cloud (API key)", "Ollama (local)", "LM Studio (local)", "OpenRouter", "Custom"];
+                                current-index <=> root.provider-preset;
+                                selected(text) => { root.apply-provider-preset(text); }
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            width: 280px;
+                            FieldLabel { text: "API Endpoint (OpenAI-compatible)"; }
+                            LineEdit { text <=> root.set-endpoint; }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            FieldLabel { text: "API Key (empty = not sent, for local servers)"; }
+                            LineEdit { text <=> root.set-api-key; input-type: password; }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            FieldLabel { text: "Model"; }
+                            HorizontalLayout {
+                                spacing: 4px;
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    model: root.model-items;
+                                    current-index <=> root.model-index;
+                                    selected(text) => { root.apply-model(text); }
+                                }
+                                IconButton {
+                                    clicked => { root.refresh-models(); }
+                                }
+                            }
+                        }
+                    }
+
+                    Text { text: "Languages"; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            spacing: 2px;
+                            FieldLabel { text: "Source Language"; }
+                            LineEdit { text <=> root.set-source-lang; }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            FieldLabel { text: "Target Language"; }
+                            LineEdit { text <=> root.set-target-lang; }
+                        }
+                        Rectangle { }
+                    }
+
+                    Text { text: "Performance"; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            spacing: 2px;
+                            FieldLabel { text: "Batch Size (entries/request)"; }
+                            LineEdit { text <=> root.set-batch-size; input-type: number; }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            FieldLabel { text: "Concurrency (requests in parallel)"; }
+                            LineEdit { text <=> root.set-concurrency; input-type: number; }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            FieldLabel { text: "Context Before (lines)"; }
+                            LineEdit { text <=> root.set-context-before; input-type: number; }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            FieldLabel { text: "Context After (lines)"; }
+                            LineEdit { text <=> root.set-context-after; input-type: number; }
+                        }
+                    }
+
+                    Text { text: "Translation Prompt"; font-weight: 700; }
+                    Text {
+                        text: "Placeholders: {source_language} {target_language} {glossary}";
+                        font-size: 11px;
+                        color: #888;
+                    }
+                    Rectangle {
+                        min-height: 170px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #d5d8e0;
+                        TextEdit {
+                            width: parent.width;
+                            height: parent.height;
+                            text <=> root.set-prompt;
+                            wrap: word-wrap;
+                            font-size: 12px;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        Button { text: "Save Settings"; clicked => { root.save-settings(); } }
+                    }
+                }
+            }
+        }
+
+        // ================================================== status bar
+        Rectangle {
+            height: 28px;
+            background: #f2f3f7;
+            HorizontalLayout {
+                padding-left: 10px;
+                Text {
+                    text: root.status-message;
+                    vertical-alignment: center;
+                    font-size: 12px;
+                    color: #444;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}
