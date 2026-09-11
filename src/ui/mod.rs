@@ -1,28 +1,31 @@
 //! Slint <-> Rust glue.
 //!
-//! The UI thread only performs quick SQLite reads for the visible page and
-//! receives results from background workers via
-//! [`slint::Weak::upgrade_in_event_loop`]. Scan / translate / export all
-//! run on plain threads and are cancelable.
+//! Windows:
+//! - `AppWindow` — main window with the Project / Glossary / Settings tabs
+//!   (heavy work on background threads, results pushed back via
+//!   `upgrade_in_event_loop`).
+//! - `ProfileEditorWindow` — modal to create/edit one AI profile
+//!   (endpoint / key / model / temperature), applied on Confirm.
+//!
+//! Settings fields auto-save into SQLite on every edit, so the translate
+//! flows always read the current values from the DB.
 
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
-use crate::ai::{
-    OpenAiCompatibleProvider, ProviderConfig, TranslationProvider as _,
-};
+use crate::ai::{OpenAiCompatibleProvider, ProviderConfig, TranslationProvider as _};
 use crate::core::context::ContextWindow;
 use crate::core::engine::{detect_engine, engine_display_name, registry, GameEngine};
 use crate::core::glossary;
-use crate::core::project::Project;
+use crate::core::project::{new_id, now_unix, Project};
 use crate::core::scan::scan_project;
 use crate::core::translation::TranslationStatus;
-use crate::database::Db;
+use crate::database::{AiProfile, Db};
 use crate::translation::pipeline;
 
 slint::include_modules!();
@@ -31,19 +34,22 @@ slint::include_modules!();
 const PAGE_SIZE: usize = 200;
 
 pub fn run(db: Arc<Db>) -> Result<()> {
-    let ui = AppWindow::new()?;
+    let app = AppWindow::new()?;
+    let editor = ProfileEditorWindow::new()?;
     let cancel = Arc::new(AtomicBool::new(false));
 
-    load_settings(&ui, &db);
+    load_settings(&app, &db);
     if let Some(project) = current_project(&db) {
-        apply_project(&ui, &project);
-        if refresh_stats(&ui, &db, &project).is_ok() {
-            refresh_entries(&ui, &db, &project);
+        apply_project(&app, &project);
+        if refresh_stats(&app, &db, &project).is_ok() {
+            refresh_entries(&app, &db, &project);
         }
-        refresh_glossary(&ui, &db);
+        refresh_glossary(&app, &db);
     }
-    wire_callbacks(&ui, db, cancel);
-    ui.run()?;
+    wire_app_callbacks(&app, db.clone(), cancel);
+    wire_settings_callbacks(&app, &editor, db);
+    let _ = app.show();
+    let _ = app.run()?;
     Ok(())
 }
 
@@ -61,8 +67,6 @@ fn engine_for(project: &Project) -> Option<&'static dyn GameEngine> {
 fn apply_project(ui: &AppWindow, project: &Project) {
     ui.set_project_path(project.path.clone().into());
     ui.set_engine_name(engine_display_name(&project.engine_id).into());
-    ui.set_set_source_lang(project.source_language.clone().into());
-    ui.set_set_target_lang(project.target_language.clone().into());
 }
 
 // ------------------------------------------------------------------ refresh
@@ -153,7 +157,7 @@ fn load_entry_detail(ui: &AppWindow, db: &Db, id: &str) {
     ui.set_sel_glossary_hint(hint.into());
 }
 
-// ----------------------------------------------------------------- settings
+// ------------------------------------------------------- settings utilities
 
 fn setting_or(db: &Db, key: &str, default: &str) -> String {
     db.setting_get_or(key, default).unwrap_or_else(|_| default.to_string())
@@ -167,61 +171,36 @@ fn parse_or<T: std::str::FromStr>(db: &Db, key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-fn load_settings(ui: &AppWindow, db: &Db) {
-    let endpoint = setting_or(db, "api_endpoint", "https://api.openai.com/v1");
-    ui.set_provider_preset(preset_index_for(&endpoint));
-    ui.set_set_endpoint(endpoint.clone().into());
-    ui.set_set_api_key(setting_or(db, "api_key", "").into());
-
-    // The remembered model is per provider.
-    let key = provider_key_for(&endpoint);
-    let model = db
-        .setting_get(&format!("model:{key}"))
-        .ok()
-        .flatten()
-        .filter(|m| !m.trim().is_empty())
-        .or_else(|| {
-            db.setting_get("model")
-                .ok()
-                .flatten()
-                .filter(|m| !m.trim().is_empty())
-        })
-        .unwrap_or_else(|| default_model_for(key).to_string());
-    set_model_dropdown(ui, &model);
-
-    ui.set_set_batch_size(parse_or::<usize>(db, "batch_size", 20).to_string().into());
-    ui.set_set_concurrency(parse_or::<usize>(db, "concurrency", 2).to_string().into());
-    ui.set_set_context_before(parse_or::<u32>(db, "context_before", 1).to_string().into());
-    ui.set_set_context_after(parse_or::<u32>(db, "context_after", 1).to_string().into());
-    // An empty stored prompt falls back to the built-in default.
-    let prompt = db
-        .setting_get("prompt_template")
-        .ok()
-        .flatten()
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| pipeline::default_prompt_template().to_string());
-    ui.set_set_prompt(prompt.into());
-    if let Some(project) = current_project(db) {
-        ui.set_set_source_lang(project.source_language.clone().into());
-        ui.set_set_target_lang(project.target_language.clone().into());
-    } else {
-        ui.set_set_source_lang(setting_or(db, "source_language", "English").into());
-        ui.set_set_target_lang(setting_or(db, "target_language", "Thai").into());
+fn context_window(db: &Db) -> ContextWindow {
+    ContextWindow {
+        before: parse_or::<u32>(db, "context_before", 1).clamp(0, 10),
+        after: parse_or::<u32>(db, "context_after", 1).clamp(0, 10),
     }
 }
 
-/// Fill the model dropdown with one item (the remembered model). The full
-/// list arrives via the refresh button.
-fn set_model_dropdown(ui: &AppWindow, model: &str) {
-    ui.set_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
-        model.to_string(),
-    )]))));
-    ui.set_model_index(0);
-    ui.set_set_model(model.to_string().into());
+fn preset_index_for(endpoint: &str) -> i32 {
+    let e = endpoint.to_lowercase();
+    if e.contains("ollama.com") {
+        1 // Ollama Cloud
+    } else if e.contains(":11434") {
+        2 // Ollama local
+    } else if e.contains(":1234") {
+        3 // LM Studio
+    } else if e.contains("openrouter") {
+        4
+    } else if e.contains("api.openai.com") {
+        0
+    } else {
+        5 // Custom
+    }
 }
 
-/// Stable settings-key suffix per provider, so each provider remembers its
-/// own model: `model:<key>`.
+/// Cloud endpoints that genuinely require a key; local servers do not.
+fn needs_api_key(endpoint: &str) -> bool {
+    let e = endpoint.to_lowercase();
+    e.contains("api.openai.com") || e.contains("ollama.com") || e.contains("openrouter.ai")
+}
+
 fn provider_key_for(endpoint: &str) -> &'static str {
     let e = endpoint.to_lowercase();
     if e.contains("ollama.com") {
@@ -248,84 +227,460 @@ fn default_model_for(provider_key: &str) -> &'static str {
     }
 }
 
-/// Store the model both as the global last-used value and per provider.
-fn remember_model(db: &Db, endpoint: &str, model: &str) {
-    if model.trim().is_empty() {
-        return;
-    }
-    let _ = db.setting_set(&format!("model:{}", provider_key_for(endpoint)), model);
-    let _ = db.setting_set("model", model);
+/// Best-effort remembered model for a provider, used when a profile has no
+/// model of its own.
+fn model_for_endpoint(db: &Db, endpoint: &str) -> String {
+    let key = provider_key_for(endpoint);
+    db.setting_get(&format!("model:{key}"))
+        .ok()
+        .flatten()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| {
+            db.setting_get("model")
+                .ok()
+                .flatten()
+                .filter(|m| !m.trim().is_empty())
+        })
+        .unwrap_or_else(|| default_model_for(key).to_string())
 }
 
-/// Index into the Settings ComboBox model for a known endpoint.
-fn preset_index_for(endpoint: &str) -> i32 {
-    let e = endpoint.to_lowercase();
-    if e.contains("ollama.com") {
-        1 // Ollama Cloud
-    } else if e.contains(":11434") {
-        2 // Ollama local
-    } else if e.contains(":1234") {
-        3 // LM Studio
-    } else if e.contains("openrouter") {
-        4
-    } else if e.contains("api.openai.com") {
-        0
-    } else {
-        5 // Custom
-    }
-}
-
-/// Cloud endpoints that genuinely require a key; local servers do not.
-fn needs_api_key(endpoint: &str) -> bool {
-    let e = endpoint.to_lowercase();
-    e.contains("api.openai.com") || e.contains("ollama.com") || e.contains("openrouter.ai")
-}
-
-fn context_window(db: &Db) -> ContextWindow {
-    ContextWindow {
-        before: parse_or::<u32>(db, "context_before", 1).clamp(0, 10),
-        after: parse_or::<u32>(db, "context_after", 1).clamp(0, 10),
-    }
-}
-
-fn pipeline_config(ui: &AppWindow, project: &Project) -> pipeline::PipelineConfig {
-    fn nonempty_or(value: &str, fallback: &str) -> String {
-        let v = value.trim();
-        if v.is_empty() { fallback.to_string() } else { v.to_string() }
-    }
+/// Settings live in SQLite and are auto-saved on every edit, so the run
+/// flows can simply read the current values back.
+fn pipeline_config(db: &Db, project: &Project) -> pipeline::PipelineConfig {
     pipeline::PipelineConfig {
-        source_language: nonempty_or(&ui.get_set_source_lang(), &project.source_language),
-        target_language: nonempty_or(&ui.get_set_target_lang(), &project.target_language),
-        batch_size: ui.get_set_batch_size().trim().parse().unwrap_or(20),
-        concurrency: ui.get_set_concurrency().trim().parse().unwrap_or(2),
-        context: ContextWindow {
-            before: ui.get_set_context_before().trim().parse().unwrap_or(1),
-            after: ui.get_set_context_after().trim().parse().unwrap_or(1),
-        },
-        prompt_template: nonempty_or(&ui.get_set_prompt(), pipeline::default_prompt_template()),
+        source_language: setting_or(db, "source_language", &project.source_language),
+        target_language: setting_or(db, "target_language", &project.target_language),
+        batch_size: parse_or(db, "batch_size", 20),
+        concurrency: parse_or(db, "concurrency", 2),
+        context: context_window(db),
+        prompt_template: db
+            .setting_get("prompt_template")
+            .ok()
+            .flatten()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| pipeline::default_prompt_template().to_string()),
     }
     .clamped()
 }
 
-/// Provider settings are read from the live Settings fields, so changing
-/// the endpoint/model takes effect on the next run without saving.
-/// "Save Settings" persists them for the next app start.
-fn build_provider(ui: &AppWindow) -> OpenAiCompatibleProvider {
+fn build_provider(db: &Db, purpose_key: &str) -> OpenAiCompatibleProvider {
+    let profile = db.ai_profile_for_purpose(purpose_key).ok();
+    let endpoint = profile
+        .as_ref()
+        .map(|p| p.endpoint.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let api_key = profile
+        .as_ref()
+        .map(|p| p.api_key.trim().to_string())
+        .unwrap_or_default();
+    let model = profile
+        .as_ref()
+        .map(|p| p.model.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| model_for_endpoint(db, &endpoint));
+    let temperature = profile.as_ref().map(|p| p.temperature).unwrap_or(0.3);
     OpenAiCompatibleProvider::new(ProviderConfig {
-        endpoint: ui.get_set_endpoint().trim().to_string(),
-        api_key: ui.get_set_api_key().trim().to_string(),
-        model: ui.get_set_model().trim().to_string(),
-        temperature: 0.3,
+        endpoint,
+        api_key,
+        model,
+        temperature,
         timeout_secs: 180,
     })
 }
 
-// ---------------------------------------------------------------- callbacks
+fn project_language(db: &Db) -> String {
+    match current_project(db) {
+        Some(p) => p.target_language,
+        None => setting_or(db, "target_language", "Thai"),
+    }
+}
 
-/// Every callback follows the same shape: capture a `Weak<AppWindow>`,
-/// upgrade it on entry, and push heavy work to a background thread whose
-/// results come back through `upgrade_in_event_loop`.
-fn wire_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
+// ------------------------------------------------------- settings tab
+
+/// Load every settings field from the database.
+fn load_settings(ui: &AppWindow, db: &Db) {
+    let _ = db.ai_profile_ensure_default();
+    refresh_profiles(ui, db);
+    refresh_profile_pickers(ui, db);
+
+    ui.set_set_source_lang(setting_or(db, "source_language", "English").into());
+    ui.set_set_target_lang(setting_or(db, "target_language", "Thai").into());
+    ui.set_set_batch_size(parse_or::<usize>(db, "batch_size", 20).to_string().into());
+    ui.set_set_concurrency(parse_or::<usize>(db, "concurrency", 2).to_string().into());
+    ui.set_set_context_before(parse_or::<u32>(db, "context_before", 1).to_string().into());
+    ui.set_set_context_after(parse_or::<u32>(db, "context_after", 1).to_string().into());
+    let prompt = db
+        .setting_get("prompt_template")
+        .ok()
+        .flatten()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| pipeline::default_prompt_template().to_string());
+    ui.set_set_prompt(prompt.into());
+}
+
+/// Rebuild the profile list.
+fn refresh_profiles(ui: &AppWindow, db: &Db) {
+    let rows: Vec<ProfileRow> = db
+        .ai_profile_list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| ProfileRow {
+            id: p.id.into(),
+            name: p.name.into(),
+            model: p.model.into(),
+            endpoint: p.endpoint.into(),
+        })
+        .collect();
+    ui.set_profile_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+/// Fill the per-page provider dropdowns (Project = translation,
+/// Glossary = extraction).
+fn refresh_profile_pickers(ui: &AppWindow, db: &Db) {
+    let profiles = db.ai_profile_list().unwrap_or_default();
+    let names: Vec<SharedString> =
+        profiles.iter().map(|p| SharedString::from(p.name.clone())).collect();
+    let model = ModelRc::from(Rc::new(VecModel::from(names)));
+
+    ui.set_translation_profile_items(model.clone());
+    ui.set_glossary_profile_items(model);
+
+    let index_for = |purpose: &str| {
+        let want = db.setting_get(purpose).ok().flatten().unwrap_or_default();
+        profiles
+            .iter()
+            .position(|p| p.id == want)
+            .unwrap_or(0) as i32
+    };
+    ui.set_translation_profile_index(index_for(crate::database::PURPOSE_TRANSLATION));
+    ui.set_glossary_profile_index(index_for(crate::database::PURPOSE_GLOSSARY));
+}
+
+fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc<Db>) {
+    // Shared state: which profile the editor modal is working on
+    // (None = creating a new one).
+    let editing: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    // ---------------------------------------------------- profile list
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_profile_delete(move |id| {
+            let _ = db.ai_profile_delete(&id);
+            // Repoint any purpose that referenced the deleted profile.
+            let remaining = db.ai_profile_list().unwrap_or_default();
+            if let Some(first) = remaining.first() {
+                for key in [
+                    crate::database::PURPOSE_TRANSLATION,
+                    crate::database::PURPOSE_GLOSSARY,
+                ] {
+                    let cur = db.setting_get(key).ok().flatten().unwrap_or_default();
+                    if cur.as_str() == id.as_str() {
+                        let _ = db.setting_set(key, &first.id);
+                    }
+                }
+            }
+            refresh_profiles(&weak.upgrade().unwrap(), &db);
+            refresh_profile_pickers(&weak.upgrade().unwrap(), &db);
+            if let Some(ui) = weak.upgrade() {
+                ui.set_status_message("Profile deleted.".into());
+            }
+        });
+    }
+    {
+        let editor_weak = editor.as_weak();
+        let db = db.clone();
+        let editing_weak = Arc::clone(&editing);
+        ui.on_profile_add(move || {
+            let Some(editor) = editor_weak.upgrade() else { return };
+            let profiles = db.ai_profile_list().unwrap_or_default();
+            let mut n = profiles.len() + 1;
+            while profiles
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case(&format!("Profile {n}")))
+            {
+                n += 1;
+            }
+            let endpoint = "https://api.openai.com/v1";
+            editor.set_ed_name(format!("Profile {n}").into());
+            editor.set_ed_preset(0);
+            editor.set_ed_endpoint(endpoint.into());
+            editor.set_ed_api_key(String::new().into());
+            let model = default_model_for("openai").to_string();
+            editor.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
+                model.clone(),
+            )]))));
+            editor.set_ed_model_index(0);
+            editor.set_ed_model(model.into());
+            editor.set_ed_temperature("0.3".into());
+            editor.set_error(String::new().into());
+            *editing_weak.lock().unwrap() = None;
+            let _ = editor.show();
+        });
+    }
+    {
+        let editor_weak = editor.as_weak();
+        let db = db.clone();
+        let editing_weak = Arc::clone(&editing);
+        ui.on_profile_edit(move |id| {
+            let Some(editor) = editor_weak.upgrade() else { return };
+            let Some(p) = db.ai_profile_get(&id).ok().flatten() else { return };
+            editor.set_ed_name(p.name.clone().into());
+            editor.set_ed_preset(preset_index_for(&p.endpoint));
+            editor.set_ed_endpoint(p.endpoint.clone().into());
+            editor.set_ed_api_key(p.api_key.clone().into());
+            let model = if p.model.trim().is_empty() {
+                model_for_endpoint(&db, &p.endpoint)
+            } else {
+                p.model.clone()
+            };
+            editor.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
+                model.clone(),
+            )]))));
+            editor.set_ed_model_index(0);
+            editor.set_ed_model(model.into());
+            editor.set_ed_temperature(format!("{:.2}", p.temperature).into());
+            editor.set_error(String::new().into());
+            *editing_weak.lock().unwrap() = Some(p.id.clone());
+            let _ = editor.show();
+        });
+    }
+
+    // ---------------------------------------------------- profile modal
+    {
+        let weak = editor.as_weak();
+        editor.on_ed_apply_preset(move |name| {
+            let Some(ui) = weak.upgrade() else { return };
+            let endpoint = match name.as_str() {
+                "OpenAI (cloud)" => "https://api.openai.com/v1",
+                "Ollama Cloud (API key)" => "https://ollama.com/v1",
+                "Ollama (local)" => "http://localhost:11434/v1",
+                "LM Studio (local)" => "http://localhost:1234/v1",
+                "OpenRouter" => "https://openrouter.ai/api/v1",
+                _ => return,
+            };
+            ui.set_ed_endpoint(endpoint.into());
+            ui.set_ed_model(default_model_for(provider_key_for(endpoint)).into());
+        });
+    }
+    {
+        let weak = editor.as_weak();
+        editor.on_ed_refresh_models(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let provider = OpenAiCompatibleProvider::new(ProviderConfig {
+                endpoint: ui.get_ed_endpoint().trim().to_string(),
+                api_key: ui.get_ed_api_key().trim().to_string(),
+                model: ui.get_ed_model().trim().to_string(),
+                temperature: 0.3,
+                timeout_secs: 60,
+            });
+            let current = ui.get_ed_model().trim().to_string();
+            let ui_weak = weak.clone();
+            std::thread::spawn(move || {
+                let result = provider.list_models();
+                let _ = ui_weak.upgrade_in_event_loop(move |ui| match result {
+                    Ok(mut models) => {
+                        models.sort();
+                        models.dedup();
+                        if models.is_empty() {
+                            ui.set_error("The provider returned no models — check the endpoint/API key.".into());
+                            return;
+                        }
+                        if !current.is_empty() && !models.iter().any(|m| *m == current) {
+                            models.insert(0, current.clone());
+                        }
+                        let index =
+                            models.iter().position(|m| *m == current).unwrap_or(0);
+                        let items: Vec<SharedString> =
+                            models.into_iter().map(SharedString::from).collect();
+                        ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(items))));
+                        ui.set_ed_model_index(index as i32);
+                        ui.set_error(String::new().into());
+                    }
+                    Err(e) => ui.set_error(format!("{e:#}").into()),
+                });
+            });
+        });
+    }
+    {
+        let weak = editor.as_weak();
+        editor.on_ed_apply_model(move |model| {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_ed_model(model);
+        });
+    }
+    {
+        let weak = editor.as_weak();
+        editor.on_ed_cancel(move || {
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.hide();
+            }
+        });
+    }
+    {
+        let weak = editor.as_weak();
+        let settings_weak = ui.as_weak();
+        let db = db.clone();
+        let editing_weak = Arc::clone(&editing);
+        editor.on_ed_confirm(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let name = ui.get_ed_name().trim().to_string();
+            let endpoint = ui.get_ed_endpoint().trim().to_string();
+            let api_key = ui.get_ed_api_key().trim().to_string();
+            let model = ui.get_ed_model().trim().to_string();
+            let temperature = ui
+                .get_ed_temperature()
+                .trim()
+                .parse::<f32>()
+                .unwrap_or(f32::NAN);
+
+            if name.is_empty() {
+                ui.set_error("Profile name is empty.".into());
+                return;
+            }
+            if endpoint.is_empty() {
+                ui.set_error("API endpoint is empty.".into());
+                return;
+            }
+            if temperature.is_nan() || !(0.0..=2.0).contains(&temperature) {
+                ui.set_error("Temperature must be a number between 0.0 and 2.0.".into());
+                return;
+            }
+            let editing_id = editing_weak.lock().unwrap().clone();
+            let dup = db
+                .ai_profile_list()
+                .unwrap_or_default()
+                .iter()
+                .any(|p| {
+                    p.name.eq_ignore_ascii_case(&name)
+                        && editing_id.as_deref() != Some(p.id.as_str())
+                });
+            if dup {
+                ui.set_error(format!("A profile named \"{name}\" already exists.").into());
+                return;
+            }
+
+            let now = now_unix();
+            let profile = AiProfile {
+                id: editing_id.clone().unwrap_or_else(new_id),
+                name,
+                endpoint,
+                api_key,
+                model,
+                temperature,
+                created_at: now,
+                updated_at: now,
+            };
+            if db.ai_profile_upsert(&profile).is_err() {
+                ui.set_error("Could not save the profile.".into());
+                return;
+            }
+            // First profile becomes the active one.
+            if db.setting_get("active_profile_translation").ok().flatten().is_none() {
+                let _ = db.setting_set("active_profile_translation", &profile.id);
+            }
+            let _ = ui.hide();
+            if let Some(s) = settings_weak.upgrade() {
+                refresh_profiles(&s, &db);
+                refresh_profile_pickers(&s, &db);
+                s.set_status_message(format!("Profile \"{}\" saved.", profile.name).into());
+            }
+        });
+    }
+
+    // ------------------------------------------ per-page provider pickers
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_pick_translation_profile(move |name| {
+            let Some(ui) = weak.upgrade() else { return };
+            let found = db
+                .ai_profile_list()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| p.name.as_str() == name.as_str());
+            if let Some(p) = found {
+                let _ = db.setting_set(crate::database::PURPOSE_TRANSLATION, &p.id);
+                ui.set_status_message(
+                    format!("Translation provider: {}", p.name).into(),
+                );
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_pick_glossary_profile(move |name| {
+            let Some(ui) = weak.upgrade() else { return };
+            let found = db
+                .ai_profile_list()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| p.name.as_str() == name.as_str());
+            if let Some(p) = found {
+                let _ = db.setting_set(crate::database::PURPOSE_GLOSSARY, &p.id);
+                ui.set_status_message(format!("Glossary provider: {}", p.name).into());
+            }
+        });
+    }
+
+    // ------------------------------------------ translation (auto-saved)
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_save_source_lang(move |v| {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_set_source_lang(v.clone());
+            }
+            let _ = db.setting_set("source_language", v.trim());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_save_target_lang(move |v| {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_set_target_lang(v.clone());
+            }
+            let _ = db.setting_set("target_language", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_batch_size(move |v| {
+            let _ = db.setting_set("batch_size", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_concurrency(move |v| {
+            let _ = db.setting_set("concurrency", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_context_before(move |v| {
+            let _ = db.setting_set("context_before", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_context_after(move |v| {
+            let _ = db.setting_set("context_after", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_prompt(move |v| {
+            let _ = db.setting_set("prompt_template", v.trim());
+        });
+    }
+}
+
+// --------------------------------------------------------- app callbacks
+
+fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
     // --- Browse: pick folder -> detect engine -> create/load project -> scan
     {
         let weak = ui.as_weak();
@@ -500,11 +855,14 @@ fn wire_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                 return;
             }
             let Some(project) = current_project(&db) else { return };
-            let endpoint = ui.get_set_endpoint().trim().to_string();
-            let key = ui.get_set_api_key().trim().to_string();
-            if needs_api_key(&endpoint) && key.is_empty() {
+            let profile = db
+                .ai_profile_for_purpose(crate::database::PURPOSE_TRANSLATION)
+                .ok();
+            let endpoint = profile.as_ref().map(|p| p.endpoint.clone()).unwrap_or_default();
+            let key = profile.as_ref().map(|p| p.api_key.clone()).unwrap_or_default();
+            if needs_api_key(&endpoint) && key.trim().is_empty() {
                 ui.set_status_message(
-                    "API key is not configured — set one in Settings, or pick the Ollama preset for local models."
+                    "API key is not configured — set one in Settings for this profile."
                         .into(),
                 );
                 return;
@@ -515,8 +873,8 @@ fn wire_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             ui.set_running(true);
             ui.set_progress(0.0);
             cancel.store(false, Ordering::Relaxed);
-            let config = pipeline_config(&ui, &project);
-            let provider = build_provider(&ui);
+            let config = pipeline_config(&db, &project);
+            let provider = build_provider(&db, crate::database::PURPOSE_TRANSLATION);
             let ui_weak = ui.as_weak();
             let db = db.clone();
             let cancel = cancel.clone();
@@ -568,9 +926,12 @@ fn wire_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                 ui.set_status_message("Open a game project first.".into());
                 return;
             };
-            let endpoint = ui.get_set_endpoint().trim().to_string();
-            let key = ui.get_set_api_key().trim().to_string();
-            if needs_api_key(&endpoint) && key.is_empty() {
+            let profile = db
+                .ai_profile_for_purpose(crate::database::PURPOSE_TRANSLATION)
+                .ok();
+            let endpoint = profile.as_ref().map(|p| p.endpoint.clone()).unwrap_or_default();
+            let key = profile.as_ref().map(|p| p.api_key.clone()).unwrap_or_default();
+            if needs_api_key(&endpoint) && key.trim().is_empty() {
                 ui.set_status_message(
                     "API key is not configured — set one in Settings, or pick the Ollama preset for local models."
                         .into(),
@@ -581,10 +942,9 @@ fn wire_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             ui.set_progress(0.0);
             cancel.store(false, Ordering::Relaxed);
 
-            // Snapshot the Settings fields now: the run uses exactly what
-            // the tab shows — pressing Save Settings is not required.
-            let config = pipeline_config(&ui, &project);
-            let provider = build_provider(&ui);
+            // Snapshot settings (auto-saved) on the UI thread.
+            let config = pipeline_config(&db, &project);
+            let provider = build_provider(&db, crate::database::PURPOSE_TRANSLATION);
 
             let ui_weak = ui.as_weak();
             let db = db.clone();
@@ -649,7 +1009,8 @@ fn wire_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                         if let Some(err) = &summary.last_error {
                             let short: String = err.chars().take(150).collect();
                             ui.set_status_message(
-                                format!("{} Last error: {}", ui.get_status_message(), short).into(),
+                                format!("{} Last error: {}", ui.get_status_message(), short)
+                                    .into(),
                             );
                         }
                     }
@@ -800,153 +1161,5 @@ fn wire_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             ui.set_glossary_search(text);
             refresh_glossary(&ui, &db);
         });
-    }
-
-    // --- Provider preset (Settings tab)
-    {
-        let weak = ui.as_weak();
-        let db = db.clone();
-        ui.on_apply_provider_preset(move |name| {
-            let Some(ui) = weak.upgrade() else { return };
-            let endpoint = match name.as_str() {
-                "OpenAI (cloud)" => "https://api.openai.com/v1",
-                "Ollama Cloud (API key)" => "https://ollama.com/v1",
-                "Ollama (local)" => "http://localhost:11434/v1",
-                "LM Studio (local)" => "http://localhost:1234/v1",
-                "OpenRouter" => "https://openrouter.ai/api/v1",
-                _ => return, // Custom: keep the current endpoint
-            };
-            ui.set_set_endpoint(endpoint.into());
-
-            // Swap to the model remembered for this provider (or a sensible
-            // default); the user's choice per provider stays remembered.
-            let key = provider_key_for(endpoint);
-            let model = db
-                .setting_get(&format!("model:{key}"))
-                .ok()
-                .flatten()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| default_model_for(key).to_string());
-            set_model_dropdown(&ui, &model);
-            remember_model(&db, endpoint, &model);
-
-            match name.as_str() {
-                "Ollama Cloud (API key)" => {
-                    ui.set_status_message(
-                        "Ollama Cloud selected — paste your API key from ollama.com, pick a model (⟳ lists them), then Save Settings. Thinking is disabled automatically."
-                            .into(),
-                    );
-                }
-                "Ollama (local)" | "LM Studio (local)" => {
-                    ui.set_status_message(
-                        "Local provider selected — the API key can stay empty. Pick a model (⟳ refreshes the list), then Save Settings."
-                            .into(),
-                    );
-                }
-                _ => {}
-            }
-        });
-    }
-
-    // --- Model dropdown / refresh (Settings tab)
-    {
-        let weak = ui.as_weak();
-        let db = db.clone();
-        ui.on_apply_model(move |model| {
-            let Some(ui) = weak.upgrade() else { return };
-            ui.set_set_model(model.clone());
-            let endpoint = ui.get_set_endpoint().trim().to_string();
-            remember_model(&db, &endpoint, &model);
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let db = db.clone();
-        ui.on_refresh_models(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let provider = build_provider(&ui);
-            let current = ui.get_set_model().trim().to_string();
-            let endpoint = ui.get_set_endpoint().trim().to_string();
-            let ui_weak = ui.as_weak();
-            let db = db.clone();
-            std::thread::spawn(move || {
-                let result = provider.list_models();
-                let _ = ui_weak.upgrade_in_event_loop(move |ui| match result {
-                    Ok(mut models) => {
-                        if models.is_empty() {
-                            ui.set_status_message(
-                                "The provider returned no models — check the endpoint/API key."
-                                    .into(),
-                            );
-                            return;
-                        }
-                        models.sort();
-                        let mut items: Vec<SharedString> =
-                            models.into_iter().map(SharedString::from).collect();
-                        // Keep a remembered model that the server didn't list.
-                        if !current.is_empty()
-                            && !items.iter().any(|m| m.as_str() == current)
-                        {
-                            items.insert(0, current.clone().into());
-                        }
-                        let index =
-                            items.iter().position(|m| m.as_str() == current).unwrap_or(0);
-                        let selected = items[index].clone();
-                        ui.set_model_items(ModelRc::from(Rc::new(VecModel::from(items))));
-                        ui.set_model_index(index as i32);
-                        ui.set_set_model(selected.clone());
-                        remember_model(&db, &endpoint, &selected);
-                        let count = ui.get_model_items().row_count();
-                        ui.set_status_message(
-                            format!("Model list refreshed — {count} models.").into(),
-                        );
-                    }
-                    Err(e) => {
-                        ui.set_status_message(format!("Refresh models failed: {e:#}").into());
-                    }
-                });
-            });
-        });
-    }
-
-    // --- Settings
-    {
-        let weak = ui.as_weak();
-        let db = db.clone();
-        ui.on_save_settings(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let values: [(&str, String); 10] = [
-                ("api_endpoint", ui.get_set_endpoint().to_string()),
-                ("api_key", ui.get_set_api_key().to_string()),
-                ("model", ui.get_set_model().to_string()),
-                ("source_language", ui.get_set_source_lang().to_string()),
-                ("target_language", ui.get_set_target_lang().to_string()),
-                ("batch_size", ui.get_set_batch_size().to_string()),
-                ("concurrency", ui.get_set_concurrency().to_string()),
-                ("context_before", ui.get_set_context_before().to_string()),
-                ("context_after", ui.get_set_context_after().to_string()),
-                ("prompt_template", ui.get_set_prompt().to_string()),
-            ];
-            for (key, value) in values {
-                let _ = db.setting_set(key, &value);
-            }
-            // Remember the model per provider as well as globally.
-            remember_model(&db, &ui.get_set_endpoint(), &ui.get_set_model());
-            if let Some(project) = current_project(&db) {
-                let _ = db.project_update_languages(
-                    &project.id,
-                    &ui.get_set_source_lang(),
-                    &ui.get_set_target_lang(),
-                );
-            }
-            ui.set_status_message("Settings saved.".into());
-        });
-    }
-}
-
-fn project_language(db: &Db) -> String {
-    match current_project(db) {
-        Some(p) => p.target_language,
-        None => setting_or(db, "target_language", "Thai"),
     }
 }

@@ -1,19 +1,5 @@
 import { Button, LineEdit, CheckBox, ComboBox, ListView, ScrollView, TextEdit } from "std-widgets.slint";
 
-component ProgressBar inherits Rectangle {
-    in property <float> progress; // 0..1
-    background: #e4e6ec;
-    border-radius: 4px;
-    Rectangle {
-        x: 0;
-        y: 0;
-        height: parent.height;
-        width: parent.width * clamp(parent.progress, 0, 1);
-        background: #1c5fd6;
-        border-radius: 4px;
-    }
-}
-
 export struct EntryRow {
     id: string,
     original: string,
@@ -36,6 +22,27 @@ export struct ContextInfo {
     scene: string,
     previous: string,
     next: string,
+}
+
+export struct ProfileRow {
+    id: string,
+    name: string,
+    model: string,
+    endpoint: string,
+}
+
+component ProgressBar inherits Rectangle {
+    in property <float> progress; // 0..1
+    background: #e4e6ec;
+    border-radius: 4px;
+    Rectangle {
+        x: 0;
+        y: 0;
+        height: parent.height;
+        width: parent.width * clamp(parent.progress, 0, 1);
+        background: #1c5fd6;
+        border-radius: 4px;
+    }
 }
 
 component StatBox inherits Rectangle {
@@ -90,16 +97,48 @@ component IconButton inherits Rectangle {
     }
 }
 
-component NavButton inherits Button {
+component SectionCard inherits Rectangle {
+    background: #f8f9fc;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: #e6e8ef;
 }
+
+component SectionTitle inherits Text {
+    font-weight: 700;
+    font-size: 13px;
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked();
+    height: 38px;
+    border-radius: 6px;
+    background: root.active ? #fde3ef : ta.has-hover ? #f0f0f4 : transparent;
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+    Text {
+        text: root.label;
+        vertical-alignment: center;
+        font-size: 13px;
+        color: root.active ? #c2417c : #333;
+        font-weight: root.active ? 700 : 400;
+        x: 10px;
+    }
+}
+
+// ============================================================ main window
 
 export component AppWindow inherits Window {
     title: "Game Translator";
+    icon: @image-url("assets/app-icon.png");
     preferred-width: 1180px;
     preferred-height: 720px;
     background: white;
 
-    // ---- navigation
     in-out property <int> current-tab; // 0 = project, 1 = glossary, 2 = settings
 
     // ---- project
@@ -129,13 +168,13 @@ export component AppWindow inherits Window {
     in-out property <string> gl-target;
     in-out property <string> gl-note;
 
-    // ---- settings
-    in-out property <int> provider-preset;
-    in-out property <string> set-endpoint;
-    in property <[string]> model-items;
-    in-out property <int> model-index;
-    in-out property <string> set-api-key;
-    in-out property <string> set-model;
+    // ---- settings / AI profiles
+    in-out property <int> section; // 0 = AI Profiles, 1 = Translation, 2 = Prompt
+    in property <[ProfileRow]> profile-rows;
+    in property <[string]> translation-profile-items;
+    in-out property <int> translation-profile-index;
+    in property <[string]> glossary-profile-items;
+    in-out property <int> glossary-profile-index;
     in-out property <string> set-source-lang;
     in-out property <string> set-target-lang;
     in-out property <string> set-batch-size;
@@ -165,10 +204,18 @@ export component AppWindow inherits Window {
     callback glossary-delete(string);
     callback glossary-toggle(string, bool);
     callback apply-glossary-search(string);
-    callback save-settings();
-    callback apply-provider-preset(string);
-    callback refresh-models();
-    callback apply-model(string);
+    callback profile-edit(string);
+    callback profile-delete(string);
+    callback profile-add();
+    callback pick-translation-profile(string);
+    callback pick-glossary-profile(string);
+    callback save-source-lang(string);
+    callback save-target-lang(string);
+    callback save-batch-size(string);
+    callback save-concurrency(string);
+    callback save-context-before(string);
+    callback save-context-after(string);
+    callback save-prompt(string);
 
     VerticalLayout {
         // ================================================== header / toolbar
@@ -189,19 +236,16 @@ export component AppWindow inherits Window {
             Button { text: "Open..."; clicked => { root.browse-project(); } }
             Button { text: "Scan"; enabled: root.project-path != ""; clicked => { root.scan-project(); } }
             Rectangle { horizontal-stretch: 1; }
-            for t[idx] in [
-                { name: "Project" }, { name: "Glossary" }, { name: "Settings" },
-            ] : NavButton {
-                text: t.name;
-                clicked => { root.current-tab = idx; }
-            }
+            Button { text: "Project"; clicked => { root.current-tab = 0; } }
+            Button { text: "Glossary"; clicked => { root.current-tab = 1; } }
+            Button { text: "Settings"; clicked => { root.current-tab = 2; } }
         }
 
         // ================================================== content
         Rectangle {
             vertical-stretch: 1;
 
-            if root.current-tab == 0 : VerticalLayout {
+                    if root.current-tab == 0 : VerticalLayout {
                 // ------------------------------------------------- stats
                 HorizontalLayout {
                     padding: 10px;
@@ -372,6 +416,18 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     padding: 10px;
                     spacing: 10px;
+                    Text {
+                        text: "Provider";
+                        font-size: 11px;
+                        color: #777;
+                        vertical-alignment: center;
+                    }
+                    ComboBox {
+                        width: 250px;
+                        model: root.translation-profile-items;
+                        current-index <=> root.translation-profile-index;
+                        selected(text) => { root.pick-translation-profile(text); }
+                    }
                     if !root.running : Button {
                         text: "Translate pending";
                         primary: true;
@@ -405,6 +461,18 @@ export component AppWindow inherits Window {
                         text <=> root.glossary-search;
                         min-width: 240px;
                         edited(text) => { root.apply-glossary-search(text); }
+                    }
+                    Text {
+                        text: "Extraction provider";
+                        font-size: 11px;
+                        color: #777;
+                        vertical-alignment: center;
+                    }
+                    ComboBox {
+                        width: 250px;
+                        model: root.glossary-profile-items;
+                        current-index <=> root.glossary-profile-index;
+                        selected(text) => { root.pick-glossary-profile(text); }
                     }
                     Rectangle { horizontal-stretch: 1; }
                     Button { text: "+ Add"; clicked => { root.glossary-new(); } }
@@ -463,116 +531,225 @@ export component AppWindow inherits Window {
                 }
             }
 
-            if root.current-tab == 2 : ScrollView {
+            // ============================================== settings tab
+            if root.current-tab == 2 : HorizontalLayout {
+                // ---------------------------------------------- sidebar
                 VerticalLayout {
-                    padding: 16px;
-                    spacing: 8px;
-                    Text { text: "AI Provider"; font-weight: 700; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            spacing: 2px;
-                            FieldLabel { text: "Provider Preset"; }
-                            ComboBox {
-                                model: ["OpenAI (cloud)", "Ollama Cloud (API key)", "Ollama (local)", "LM Studio (local)", "OpenRouter", "Custom"];
-                                current-index <=> root.provider-preset;
-                                selected(text) => { root.apply-provider-preset(text); }
+                    width: 190px;
+                    padding: 12px;
+                    spacing: 4px;
+                    NavItem {
+                        label: "AI Profiles";
+                        active: root.section == 0;
+                        clicked => { root.section = 0; }
+                    }
+                    NavItem {
+                        label: "Translation";
+                        active: root.section == 1;
+                        clicked => { root.section = 1; }
+                    }
+                    NavItem {
+                        label: "Prompt";
+                        active: root.section == 2;
+                        clicked => { root.section = 2; }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+                Rectangle { width: 1px; background: #e6e8ef; }
+
+                // ---------------------------------------------- content
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
+
+                    ScrollView {
+                        vertical-stretch: 1;
+
+                        if root.section == 0 : SectionCard {
+                            VerticalLayout {
+                                padding: 14px;
+                                spacing: 8px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    SectionTitle { text: "AI Profiles"; vertical-alignment: center; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Text {
+                                        text: "saved connections — pick where to use them: Project (translation) and Glossary (extraction)";
+                                        font-size: 11px;
+                                        color: #999;
+                                        vertical-alignment: center;
+                                    }
+                                    Button { text: "+ Add Profile"; clicked => { root.profile-add(); } }
+                                }
+
+                                Rectangle {
+                                    height: 26px;
+                                    background: #eef0f5;
+                                    border-radius: 4px;
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        Text { text: "Name"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; }
+                                        Text { text: "Model"; width: 210px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                        Text { text: "Endpoint"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                        Text { text: ""; width: 132px; }
+                                    }
+                                }
+                                ListView {
+                                    min-height: 280px;
+                                    for p in root.profile-rows: Rectangle {
+                                        height: 46px;
+                                        background: white;
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            spacing: 6px;
+                                            VerticalLayout {
+                                                width: 190px;
+                                                alignment: center;
+                                                Text {
+                                                    text: p.name;
+                                                    overflow: elide;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            Text {
+                                                text: p.model;
+                                                width: 210px;
+                                                overflow: elide;
+                                                vertical-alignment: center;
+                                                font-size: 12px;
+                                                color: #555;
+                                            }
+                                            Text {
+                                                text: p.endpoint;
+                                                horizontal-stretch: 1;
+                                                overflow: elide;
+                                                vertical-alignment: center;
+                                                font-size: 12px;
+                                                color: #888;
+                                            }
+                                            Rectangle {
+                                                width: 132px;
+                                                HorizontalLayout {
+                                                    spacing: 4px;
+                                                    Button { text: "Edit"; clicked => { root.profile-edit(p.id); } }
+                                                    Button { text: "Del"; clicked => { root.profile-delete(p.id); } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        VerticalLayout {
-                            spacing: 2px;
-                            width: 280px;
-                            FieldLabel { text: "API Endpoint (OpenAI-compatible)"; }
-                            LineEdit { text <=> root.set-endpoint; }
-                        }
-                        VerticalLayout {
-                            spacing: 2px;
-                            horizontal-stretch: 1;
-                            FieldLabel { text: "API Key (empty = not sent, for local servers)"; }
-                            LineEdit { text <=> root.set-api-key; input-type: password; }
-                        }
-                        VerticalLayout {
-                            spacing: 2px;
-                            horizontal-stretch: 1;
-                            FieldLabel { text: "Model"; }
-                            HorizontalLayout {
-                                spacing: 4px;
-                                ComboBox {
-                                    horizontal-stretch: 1;
-                                    model: root.model-items;
-                                    current-index <=> root.model-index;
-                                    selected(text) => { root.apply-model(text); }
+
+                        if root.section == 1 : SectionCard {
+                            VerticalLayout {
+                                padding: 14px;
+                                spacing: 8px;
+                                SectionTitle { text: "Translation"; }
+                                Text {
+                                    text: "Saved automatically as you type.";
+                                    font-size: 11px;
+                                    color: #888;
                                 }
-                                IconButton {
-                                    clicked => { root.refresh-models(); }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        FieldLabel { text: "Source Language"; }
+                                        LineEdit {
+                                            text <=> root.set-source-lang;
+                                            edited(text) => { root.save-source-lang(text); }
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        FieldLabel { text: "Target Language"; }
+                                        LineEdit {
+                                            text <=> root.set-target-lang;
+                                            edited(text) => { root.save-target-lang(text); }
+                                        }
+                                    }
+                                    Rectangle { }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        FieldLabel { text: "Batch Size (entries/request)"; }
+                                        LineEdit {
+                                            text <=> root.set-batch-size;
+                                            input-type: number;
+                                            edited(text) => { root.save-batch-size(text); }
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        FieldLabel { text: "Concurrency (requests in parallel)"; }
+                                        LineEdit {
+                                            text <=> root.set-concurrency;
+                                            input-type: number;
+                                            edited(text) => { root.save-concurrency(text); }
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        FieldLabel { text: "Context Before (lines)"; }
+                                        LineEdit {
+                                            text <=> root.set-context-before;
+                                            input-type: number;
+                                            edited(text) => { root.save-context-before(text); }
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        FieldLabel { text: "Context After (lines)"; }
+                                        LineEdit {
+                                            text <=> root.set-context-after;
+                                            input-type: number;
+                                            edited(text) => { root.save-context-after(text); }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    Text { text: "Languages"; font-weight: 700; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            spacing: 2px;
-                            FieldLabel { text: "Source Language"; }
-                            LineEdit { text <=> root.set-source-lang; }
+                        if root.section == 2 : SectionCard {
+                            VerticalLayout {
+                                padding: 14px;
+                                spacing: 8px;
+                                SectionTitle { text: "Translation Prompt"; }
+                                Text {
+                                    text: "Placeholders: {source_language} {target_language} {glossary}";
+                                    font-size: 11px;
+                                    color: #888;
+                                }
+                                Rectangle {
+                                    min-height: 300px;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: #d5d8e0;
+                                    background: white;
+                                    TextEdit {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text <=> root.set-prompt;
+                                        wrap: word-wrap;
+                                        font-size: 12px;
+                                    }
+                                }
+                                Text {
+                                    text: "Saved automatically as you type.";
+                                    font-size: 11px;
+                                    color: #888;
+                                }
+                            }
                         }
-                        VerticalLayout {
-                            spacing: 2px;
-                            FieldLabel { text: "Target Language"; }
-                            LineEdit { text <=> root.set-target-lang; }
-                        }
-                        Rectangle { }
-                    }
-
-                    Text { text: "Performance"; font-weight: 700; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            spacing: 2px;
-                            FieldLabel { text: "Batch Size (entries/request)"; }
-                            LineEdit { text <=> root.set-batch-size; input-type: number; }
-                        }
-                        VerticalLayout {
-                            spacing: 2px;
-                            FieldLabel { text: "Concurrency (requests in parallel)"; }
-                            LineEdit { text <=> root.set-concurrency; input-type: number; }
-                        }
-                        VerticalLayout {
-                            spacing: 2px;
-                            FieldLabel { text: "Context Before (lines)"; }
-                            LineEdit { text <=> root.set-context-before; input-type: number; }
-                        }
-                        VerticalLayout {
-                            spacing: 2px;
-                            FieldLabel { text: "Context After (lines)"; }
-                            LineEdit { text <=> root.set-context-after; input-type: number; }
-                        }
-                    }
-
-                    Text { text: "Translation Prompt"; font-weight: 700; }
-                    Text {
-                        text: "Placeholders: {source_language} {target_language} {glossary}";
-                        font-size: 11px;
-                        color: #888;
-                    }
-                    Rectangle {
-                        min-height: 170px;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: #d5d8e0;
-                        TextEdit {
-                            width: parent.width;
-                            height: parent.height;
-                            text <=> root.set-prompt;
-                            wrap: word-wrap;
-                            font-size: 12px;
-                        }
-                    }
-
-                    HorizontalLayout {
-                        Button { text: "Save Settings"; clicked => { root.save-settings(); } }
                     }
                 }
             }
@@ -585,12 +762,134 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 padding-left: 10px;
                 Text {
-                    text: root.status-message;
+                    text: root.status-message == "" ? "Changes are saved automatically." : root.status-message;
                     vertical-alignment: center;
                     font-size: 12px;
                     color: #444;
                     overflow: elide;
                 }
+            }
+        }
+    }
+}
+
+// ============================================================ profile editor (modal)
+
+export component ProfileEditorWindow inherits Window {
+    title: "AI Profile";
+    icon: @image-url("assets/app-icon.png");
+    preferred-width: 560px;
+    preferred-height: 470px;
+    background: white;
+
+    in-out property <string> ed-name;
+    in-out property <int> ed-preset;
+    in-out property <string> ed-endpoint;
+    in-out property <string> ed-api-key;
+    in property <[string]> ed-model-items;
+    in-out property <int> ed-model-index;
+    in-out property <string> ed-model;
+    in-out property <string> ed-temperature;
+    in-out property <string> error;
+
+    callback ed-apply-preset(string);
+    callback ed-refresh-models();
+    callback ed-apply-model(string);
+    callback ed-confirm();
+    callback ed-cancel();
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                spacing: 2px;
+                horizontal-stretch: 1;
+                FieldLabel { text: "Profile Name"; }
+                LineEdit { text <=> root.ed-name; }
+            }
+            VerticalLayout {
+                spacing: 2px;
+                width: 200px;
+                FieldLabel { text: "Preset"; }
+                ComboBox {
+                    model: ["OpenAI (cloud)", "Ollama Cloud (API key)", "Ollama (local)", "LM Studio (local)", "OpenRouter", "Custom"];
+                    current-index <=> root.ed-preset;
+                    selected(text) => { root.ed-apply-preset(text); }
+                }
+            }
+        }
+
+        VerticalLayout {
+            spacing: 2px;
+            FieldLabel { text: "API Endpoint (OpenAI-compatible)"; }
+            LineEdit { text <=> root.ed-endpoint; }
+        }
+
+        VerticalLayout {
+            spacing: 2px;
+            FieldLabel { text: "API Key (empty = not sent, for local servers)"; }
+            LineEdit { text <=> root.ed-api-key; input-type: password; }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                spacing: 2px;
+                horizontal-stretch: 1;
+                FieldLabel { text: "Model (⟳ fetches the list from the server)"; }
+                HorizontalLayout {
+                    spacing: 4px;
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: root.ed-model-items;
+                        current-index <=> root.ed-model-index;
+                        selected(text) => { root.ed-apply-model(text); }
+                    }
+                    IconButton {
+                        clicked => { root.ed-refresh-models(); }
+                    }
+                }
+            }
+            VerticalLayout {
+                spacing: 2px;
+                width: 120px;
+                FieldLabel { text: "Temperature"; }
+                LineEdit {
+                    text <=> root.ed-temperature;
+                    input-type: number;
+                }
+            }
+        }
+
+        Text {
+            text: "Thinking / reasoning is always disabled for Ollama providers.";
+            font-size: 11px;
+            color: #888;
+        }
+
+        if root.error != "" : Text {
+            text: root.error;
+            font-size: 12px;
+            color: #c62828;
+            wrap: word-wrap;
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Button {
+                text: "Confirm";
+                primary: true;
+                clicked => { root.ed-confirm(); }
+            }
+            Button {
+                text: "Cancel";
+                clicked => { root.ed-cancel(); }
             }
         }
     }

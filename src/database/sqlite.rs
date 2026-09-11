@@ -14,6 +14,19 @@ use crate::core::project::Project;
 use crate::core::source::SourceEntry;
 use crate::core::translation::{TranslationEntry, TranslationStatus};
 
+/// A named, saveable AI configuration (endpoint + key + model + temperature).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiProfile {
+    pub id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+    pub temperature: f32,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// Result of a project scan.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScanReport {
@@ -34,6 +47,12 @@ pub struct ProjectStats {
     pub pending: i64,
     pub failed: i64,
 }
+
+// ----------------------------------------------------------- ai profiles
+
+/// Settings keys that assign a profile to a purpose.
+pub const PURPOSE_TRANSLATION: &str = "translation_profile_id";
+pub const PURPOSE_GLOSSARY: &str = "glossary_profile_id";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -114,15 +133,6 @@ impl Db {
         )
         .optional()
         .map_err(Into::into)
-    }
-
-    pub fn project_update_languages(&self, id: &str, source: &str, target: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE projects SET source_language = ?2, target_language = ?3, updated_at = ?4 WHERE id = ?1",
-            params![id, source, target, crate::core::project::now_unix()],
-        )?;
-        Ok(())
     }
 
     // -------------------------------------------------------- scan (sources)
@@ -503,8 +513,7 @@ impl Db {
 
     // -------------------------------------------------------------- settings
 
-    pub fn setting_get(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+    pub fn setting_get(&self, key: &str) -> Result<Option<String>> {        let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT value FROM settings WHERE key = ?1",
             params![key],
@@ -526,6 +535,113 @@ impl Db {
 
     pub fn setting_get_or(&self, key: &str, default: &str) -> Result<String> {
         Ok(self.setting_get(key)?.unwrap_or_else(|| default.to_string()))
+    }
+
+    // ----------------------------------------------------------- ai profiles
+
+    pub fn ai_profile_list(&self) -> Result<Vec<AiProfile>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, endpoint, api_key, model, temperature, created_at, updated_at
+             FROM ai_profiles ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_ai_profile)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    #[allow(dead_code)] // repository API; currently used by tests
+    pub fn ai_profile_get(&self, id: &str) -> Result<Option<AiProfile>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, endpoint, api_key, model, temperature, created_at, updated_at
+             FROM ai_profiles WHERE id = ?1",
+            params![id],
+            row_to_ai_profile,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Insert or update a profile. Duplicate names (on a *different* id)
+    /// return an error the UI can show.
+    pub fn ai_profile_upsert(&self, profile: &AiProfile) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ai_profiles (id, name, endpoint, api_key, model, temperature, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, endpoint=excluded.endpoint, api_key=excluded.api_key,
+                model=excluded.model, temperature=excluded.temperature, updated_at=excluded.updated_at",
+            params![
+                profile.id,
+                profile.name,
+                profile.endpoint,
+                profile.api_key,
+                profile.model,
+                profile.temperature,
+                profile.created_at,
+                profile.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn ai_profile_delete(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM ai_profiles WHERE id = ?1", params![id])?;
+        Ok(())
+	}
+
+    /// First-run migration: with no profiles saved, turn the legacy flat
+    /// settings (api_endpoint/api_key/model) into a "Default" profile and
+    /// assign it to every purpose. Also migrates the old
+    /// `active_profile_translation` pointer.
+    pub fn ai_profile_ensure_default(&self) -> Result<()> {
+        if self.ai_profile_list()?.is_empty() {
+            let now = crate::core::project::now_unix();
+            let profile = AiProfile {
+                id: crate::core::project::new_id(),
+                name: "Default".to_string(),
+                endpoint: self.setting_get_or("api_endpoint", "https://api.openai.com/v1")?,
+                api_key: self.setting_get("api_key")?.unwrap_or_default(),
+                model: self.setting_get("model")?.unwrap_or_default(),
+                temperature: 0.3,
+                created_at: now,
+                updated_at: now,
+            };
+            self.ai_profile_upsert(&profile)?;
+        }
+        // Purpose pointers: migrate the legacy active pointer, else point at
+        // the first profile.
+        let first = self.ai_profile_list()?.first().map(|p| p.id.clone());
+        if let Some(first) = first {
+            if self.setting_get(PURPOSE_TRANSLATION)?.is_none() {
+                let legacy =
+                    self.setting_get("active_profile_translation")?.unwrap_or_default();
+                let id = if legacy.is_empty() { first.clone() } else { legacy };
+                self.setting_set(PURPOSE_TRANSLATION, &id)?;
+            }
+            if self.setting_get(PURPOSE_GLOSSARY)?.is_none() {
+                self.setting_set(PURPOSE_GLOSSARY, &first)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The profile assigned to a purpose ("translation_profile_id" /
+    /// "glossary_profile_id"), falling back to the first one.
+    pub fn ai_profile_for_purpose(&self, purpose_key: &str) -> Result<AiProfile> {
+        self.ai_profile_ensure_default()?;
+        let profiles = self.ai_profile_list()?;
+        let want = self.setting_get(purpose_key)?.unwrap_or_default();
+        profiles
+            .iter()
+            .find(|p| p.id == want)
+            .or_else(|| profiles.first())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no AI profile exists"))
     }
 }
 
@@ -636,13 +752,42 @@ fn migrate(conn: &Connection) -> Result<()> {
             PRIMARY KEY (source_hash, target_language)
         );
 
+        CREATE TABLE IF NOT EXISTS ai_profiles (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            endpoint TEXT NOT NULL,
+            api_key TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            temperature REAL NOT NULL DEFAULT 0.3,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
         "#,
     )?;
+    // Older databases created ai_profiles before the temperature column.
+    let _ = conn.execute(
+        "ALTER TABLE ai_profiles ADD COLUMN temperature REAL NOT NULL DEFAULT 0.3",
+        [],
+    );
     Ok(())
+}
+
+fn row_to_ai_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiProfile> {
+    Ok(AiProfile {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        endpoint: row.get(2)?,
+        api_key: row.get(3)?,
+        model: row.get(4)?,
+        temperature: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
 }
 
 #[cfg(test)]
@@ -873,6 +1018,92 @@ mod tests {
         // Upsert overwrites.
         d.memory_put_many(&[("h1".into(), "Hello".into(), "ฮัลโหล".into())], "Thai").unwrap();
         assert_eq!(d.memory_get("h1", "Thai").unwrap().as_deref(), Some("ฮัลโหล"));
+    }
+
+    #[test]
+    fn ai_profiles_crud_and_default_migration() {
+        let d = db();
+        d.setting_set("api_endpoint", "https://ollama.com/v1").unwrap();
+        d.setting_set("api_key", "sk-x").unwrap();
+        d.setting_set("model", "gemma4:31b").unwrap();
+
+        // First run: legacy settings become the "Default" profile.
+        d.ai_profile_ensure_default().unwrap();
+        let list = d.ai_profile_list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Default");
+        assert_eq!(list[0].endpoint, "https://ollama.com/v1");
+        assert_eq!(list[0].api_key, "sk-x");
+        assert_eq!(list[0].model, "gemma4:31b");
+        assert_eq!(
+            d.setting_get("translation_profile_id").unwrap().as_deref(),
+            Some(list[0].id.as_str())
+        );
+        assert_eq!(
+            d.setting_get("glossary_profile_id").unwrap().as_deref(),
+            Some(list[0].id.as_str())
+        );
+
+        // Idempotent.
+        d.ai_profile_ensure_default().unwrap();
+        assert_eq!(d.ai_profile_list().unwrap().len(), 1);
+
+        // Edit / rename via upsert.
+        let mut p = list[0].clone();
+        p.name = "Ollama".into();
+        p.model = "gpt-oss:120b-cloud".into();
+        d.ai_profile_upsert(&p).unwrap();
+        let got = d.ai_profile_get(&p.id).unwrap().unwrap();
+        assert_eq!(got.name, "Ollama");
+        assert_eq!(got.model, "gpt-oss:120b-cloud");
+
+        // Duplicate name on a different id is rejected.
+        let dup = AiProfile {
+            id: "other-id".into(),
+            name: "Ollama".into(),
+            endpoint: "https://api.openai.com/v1".into(),
+            api_key: String::new(),
+            model: String::new(),
+            temperature: 0.3,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(d.ai_profile_upsert(&dup).is_err());
+
+        // Purpose lookup falls back to the first profile.
+        let for_translation = d.ai_profile_for_purpose("translation_profile_id").unwrap();
+        assert_eq!(for_translation.id, p.id);
+
+        let second = AiProfile {
+            id: "second".into(),
+            name: "Second".into(),
+            endpoint: "https://api.openai.com/v1".into(),
+            api_key: String::new(),
+            model: "gpt-4o-mini".into(),
+            temperature: 0.3,
+            created_at: 0,
+            updated_at: 0,
+        };
+        d.ai_profile_upsert(&second).unwrap();
+
+        // Assigning a purpose picks exactly that profile.
+        d.setting_set("glossary_profile_id", "second").unwrap();
+        assert_eq!(
+            d.ai_profile_for_purpose("glossary_profile_id").unwrap().id,
+            "second"
+        );
+        assert_eq!(
+            d.ai_profile_for_purpose("translation_profile_id").unwrap().id,
+            p.id
+        );
+
+        // Delete; the purpose pointer falls back to a remaining profile.
+        d.ai_profile_delete(&p.id).unwrap();
+        assert!(d.ai_profile_get(&p.id).unwrap().is_none());
+        assert_eq!(
+            d.ai_profile_for_purpose("translation_profile_id").unwrap().id,
+            "second"
+        );
     }
 
     #[test]
