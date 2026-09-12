@@ -383,6 +383,7 @@ fn load_settings(ui: &AppWindow, db: &Db) {
     ui.set_set_concurrency(parse_or::<usize>(db, "concurrency", 2).to_string().into());
     ui.set_set_context_before(parse_or::<u32>(db, "context_before", 1).to_string().into());
     ui.set_set_context_after(parse_or::<u32>(db, "context_after", 1).to_string().into());
+    ui.set_set_export_to_none(setting_or(db, "export_to_none", "0") == "1");
     let prompt = db
         .setting_get("prompt_template")
         .ok()
@@ -784,6 +785,12 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
         let db = db.clone();
         ui.on_save_context_after(move |v| {
             let _ = db.setting_set("context_after", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_export_to_none(move |v| {
+            let _ = db.setting_set("export_to_none", if v { "1" } else { "0" });
         });
     }
     {
@@ -1354,6 +1361,7 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                             Path::new(&project.path),
                             &entries,
                             &project.target_language,
+                            setting_or(&db, "export_to_none", "0") == "1",
                         )?;
                         Ok((entries.len(), report))
                     })();

@@ -311,6 +311,7 @@ export component AppWindow inherits Window {
     in-out property <string> set-context-before;
     in-out property <string> set-context-after;
     in-out property <string> set-prompt;
+    in-out property <bool> set-export-to-none;
 
     // ---- worker state
     in property <bool> running;
@@ -390,6 +391,7 @@ export component AppWindow inherits Window {
     callback save-context-before(string);
     callback save-context-after(string);
     callback save-prompt(string);
+    callback save-export-to-none(bool);
     callback close-editor();
     callback confirm-delete();
     callback cancel-delete();
@@ -1025,6 +1027,11 @@ export component AppWindow inherits Window {
                                             edited(text) => { root.save-context-after(text); }
                                         }
                                     }
+                                }
+                                CheckBox {
+                                    text: "Write translations to tl/None (for games without a language menu)";
+                                    checked <=> root.set-export-to-none;
+                                    toggled => { root.save-export-to-none(self.checked); }
                                 }
                             }
                         }

@@ -57,12 +57,13 @@ impl GameEngine for RenpyEngine {
         path: &Path,
         translations: &[TranslationEntry],
         target_language: &str,
+        to_default_language: bool,
     ) -> Result<ExportReport> {
         let root = crate::core::engine::game_root(path);
         if !root.is_dir() {
             anyhow::bail!("game directory not found: {}", root.display());
         }
-        exporter::export(&root, translations, target_language)
+        exporter::export(&root, translations, target_language, to_default_language)
     }
 
     fn protected_tokens(&self, text: &str) -> Vec<String> {

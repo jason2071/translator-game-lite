@@ -56,6 +56,7 @@ pub fn export(
     game_root: &Path,
     translations: &[TranslationEntry],
     target_language: &str,
+    to_default_language: bool,
 ) -> Result<ExportReport> {
     let mut with_text: Vec<&TranslationEntry> = Vec::new();
     for t in translations {
@@ -68,7 +69,8 @@ pub fn export(
         with_text.into_iter().partition(|t| t.source.file_path.contains('!'));
 
     let mut report = export_in_place(game_root, &real_entries)?;
-    let (files, written) = export_virtual(game_root, &virtual_entries, target_language)?;
+    let (files, written) =
+        export_virtual(game_root, &virtual_entries, target_language, to_default_language)?;
     report.files_written += files;
     report.entries_written += written;
     Ok(report)
@@ -76,16 +78,24 @@ pub fn export(
 
 /// Write archive-sourced translations into `tl/<language>/<archive>_gtl.rpy`
 /// as old/new string pairs, merging with whatever is already there.
+/// With `to_default_language` the file lands in `tl/None` (header
+/// `translate None strings:`), applying to the game's original language —
+/// for games without a language selector.
 /// Returns (files_written, entries_written).
 fn export_virtual(
     game_root: &Path,
     entries: &[&TranslationEntry],
     target_language: &str,
+    to_default_language: bool,
 ) -> Result<(usize, usize)> {
     if entries.is_empty() {
         return Ok((0, 0));
     }
-    let language = sanitize_dir_name(target_language);
+    let language = if to_default_language {
+        "None".to_string()
+    } else {
+        sanitize_dir_name(target_language)
+    };
     let mut by_archive: std::collections::BTreeMap<&str, Vec<&TranslationEntry>> =
         std::collections::BTreeMap::new();
     for t in entries {
@@ -355,6 +365,7 @@ mod tests {
                 entry("script.rpy", 4, "Fine.", "โอเค"),
             ],
             "Thai",
+            false,
         )
         .unwrap();
 
@@ -387,6 +398,7 @@ mod tests {
                 entry("tl/thai/script.rpy", 6, "Bye", "ลาก่อน"),
             ],
             "Thai",
+            false,
         )
         .unwrap();
 
@@ -404,7 +416,7 @@ mod tests {
         let file = root.join("script.rpy");
         fs::write(&file, "e \"Hello\"\n").unwrap();
 
-        let report = export(&root, &[entry("script.rpy", 1, "Outdated", "เดิม")], "Thai").unwrap();
+        let report = export(&root, &[entry("script.rpy", 1, "Outdated", "เดิม")], "Thai", false).unwrap();
 
         assert_eq!(report.entries_skipped, 1);
         assert_eq!(report.entries_written, 0);
@@ -420,6 +432,7 @@ mod tests {
             &root,
             &[entry("s.rpy", 1, "He said \"hi\"", "เขาพูดว่า \"ไฮ\"")],
             "Thai",
+            false,
         )
         .unwrap();
 
@@ -436,6 +449,7 @@ mod tests {
             &root,
             &[entry("s.rpy", 1, "A", "เอ"), entry("s.rpy", 2, "gone", "x")],
             "Thai",
+            false,
         )
         .unwrap();
 
@@ -449,7 +463,7 @@ mod tests {
     fn missing_file_counts_as_skipped() {
         let root = temp_root("missing");
         let report =
-            export(&root, &[entry("gone.rpy", 1, "A", "เอ")], "Thai").unwrap();
+            export(&root, &[entry("gone.rpy", 1, "A", "เอ")], "Thai", false).unwrap();
         assert_eq!(report.entries_skipped, 1);
         assert_eq!(report.files_written, 0);
     }
@@ -470,6 +484,7 @@ mod tests {
                 entry("archive.rpa!aisha.rpy", 30, "Hello [name]", "สวัสดี [name]"),
             ],
             "thai",
+            false,
         )
         .unwrap();
 
@@ -503,6 +518,7 @@ mod tests {
                 entry("archive.rpa!s.rpy", 2, "Brand new", "ใหม่"),
             ],
             "Thai",
+            false,
         )
         .unwrap();
 
@@ -512,5 +528,30 @@ mod tests {
             out,
             "translate Thai strings:\n\n    old \"Old pair\"\n    new \"เก่า\"\n\n    old \"Hello\"\n    new \"สวัสดี\"\n\n    old \"Brand new\"\n    new \"ใหม่\"\n"
         );
+    }
+
+    #[test]
+    fn to_default_language_writes_tl_none() {
+        let root = temp_root("rp.none");
+        let report = export(
+            &root,
+            &[
+                entry("archive.rpa!s.rpy", 1, "Hello", "สวัสดี"),
+                entry("archive.rpa!s.rpy", 2, "Brand new", "ใหม่"),
+            ],
+            "Thai",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.files_written, 1);
+        let path = root.join("tl/None/archive_gtl.rpy");
+        let out = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            out,
+            "translate None strings:\n\n    old \"Brand new\"\n    new \"ใหม่\"\n\n    old \"Hello\"\n    new \"สวัสดี\"\n"
+        );
+        // The language-named folder must not be created in this mode.
+        assert!(!root.join("tl/Thai").exists());
     }
 }

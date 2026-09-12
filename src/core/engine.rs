@@ -46,12 +46,15 @@ pub trait GameEngine: Sync {
     ///
     /// `target_language` is needed for engines that export through
     /// generated translation files (Ren'Py `tl/<lang>` for scripts that
-    /// live inside .rpa archives).
+    /// live inside .rpa archives). `to_default_language` writes those
+    /// files into `tl/None` instead, applying them to the game's original
+    /// language — for games that ship no language selector.
     fn export(
         &self,
         path: &Path,
         translations: &[TranslationEntry],
         target_language: &str,
+        to_default_language: bool,
     ) -> Result<ExportReport>;
 
     /// Protected tokens (placeholders/tags) that must survive translation.
