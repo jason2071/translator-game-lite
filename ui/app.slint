@@ -134,6 +134,104 @@ component NavItem inherits Rectangle {
     }
 }
 
+/// Flat button for dialogs: neutral (Cancel), red (Delete) or blue (Confirm).
+component DialogButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> danger;
+    in property <bool> primary;
+    callback clicked();
+    height: 34px;
+    min-width: 96px;
+    border-radius: 7px;
+    background: root.danger
+        ? (ta.pressed ? #b91c1c : ta.has-hover ? #dc2626 : #ef4444)
+        : root.primary
+            ? (ta.pressed ? #174a9f : ta.has-hover ? #1a55bd : #1c5fd6)
+            : (ta.pressed ? #d8dbe3 : ta.has-hover ? #e4e7ee : #eef0f5);
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+    Text {
+        text: root.label;
+        font-size: 13px;
+        font-weight: 600;
+        color: root.danger || root.primary ? white : #333;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// Dimmed overlay covering the whole window with a centered card.
+component ConfirmDialog inherits Rectangle {
+    in property <string> title;
+    in property <string> message;
+    callback accepted();
+    callback rejected();
+    background: #00000066;
+    TouchArea {
+        clicked => { root.rejected(); } // click on the dimmed area = cancel
+    }
+    fs := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        init => { fs.focus(); }
+        key-pressed(e) => {
+            if e.text == Key.Escape {
+                root.rejected();
+                accept
+            } else if e.text == Key.Return {
+                root.accepted();
+                accept
+            } else {
+                reject
+            }
+        }
+        Rectangle {
+            width: 430px;
+            height: 208px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: white;
+            border-radius: 12px;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #00000045;
+            TouchArea {} // swallow clicks so the card body is not "outside"
+            VerticalLayout {
+                padding: 22px;
+                spacing: 10px;
+                Text {
+                    text: root.title;
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: #1a1a1a;
+                }
+                Text {
+                    text: root.message;
+                    font-size: 13px;
+                    color: #555;
+                    wrap: word-wrap;
+                    overflow: elide;
+                    vertical-stretch: 1;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    DialogButton {
+                        label: "Cancel";
+                        clicked => { root.rejected(); }
+                    }
+                    DialogButton {
+                        label: "Delete";
+                        danger: true;
+                        clicked => { root.accepted(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ============================================================ main window
 
 export component AppWindow inherits Window {
@@ -192,6 +290,31 @@ export component AppWindow inherits Window {
     in property <float> progress; // 0..1
     in-out property <string> status-message;
 
+    // ---- delete confirmation modal
+    in-out property <bool> confirm-visible;
+    in-out property <string> confirm-kind; // "profile" | "glossary"
+    in-out property <string> confirm-pending-id;
+    in-out property <string> confirm-title;
+    in-out property <string> confirm-message;
+
+    // ---- AI profile add/edit overlay
+    in-out property <bool> ed-visible;
+    in-out property <string> ed-name;
+    in-out property <int> ed-preset;
+    in-out property <string> ed-endpoint;
+    in-out property <string> ed-api-key;
+    in property <[string]> ed-model-items;
+    in-out property <int> ed-model-index;
+    in-out property <string> ed-model;
+    in-out property <string> ed-temperature;
+    in-out property <string> ed-error;
+
+    // ---- folder picker overlay (replaces the native file dialog)
+    in-out property <bool> fp-visible;
+    in-out property <string> fp-path;   // current directory ("" = drive list)
+    in property <[string]> fp-items;    // subdirectories, ".." first
+    in-out property <string> fp-status; // error line
+
     callback browse-project();
     callback scan-project();
     callback start-translate();
@@ -221,6 +344,17 @@ export component AppWindow inherits Window {
     callback save-context-after(string);
     callback save-prompt(string);
     callback close-editor();
+    callback confirm-delete();
+    callback cancel-delete();
+    callback ed-apply-preset(string);
+    callback ed-refresh-models();
+    callback ed-apply-model(string);
+    callback ed-confirm();
+    callback ed-cancel();
+    callback fp-navigate(string);
+    callback fp-go();
+    callback fp-confirm();
+    callback fp-cancel();
 
     VerticalLayout {
         // ================================================== header / toolbar
@@ -276,76 +410,72 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         horizontal-stretch: 3;
                         spacing: 6px;
+                        // Header + row delegates MUST use the same column math.
+                        // A HorizontalLayout distributes space by stretch *plus*
+                        // each label's min text width, which drifts a few px from
+                        // the fixed formula, so both sides position absolutely.
                         header := Rectangle {
                             height: 30px;
                             background: #eef0f5;
                             border-radius: 4px;
-                            HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                Text { text: "Original"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                Text { text: "Translation"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                Text { text: "Status"; width: 90px; font-weight: 600; vertical-alignment: center; }
+                            property <length> colw: (header.width - 20px - 90px) / 2;
+                            Text {
+                                x: 10px;
+                                width: header.colw;
+                                text: "Original";
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                x: 10px + header.colw;
+                                width: header.colw;
+                                text: "Translation";
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                x: 10px + header.colw * 2;
+                                width: 90px;
+                                text: "Status";
+                                font-weight: 600;
+                                vertical-alignment: center;
                             }
                         }
                         ListView {
                             vertical-stretch: 1;
-                            // DEBUG MODE still on: row zebra + column colors.
-                            // Texts are anchored INSIDE their own column box
-                            // (absolute position) so they cannot shift.
                             for row[idx] in root.entries: rowrect := Rectangle {
                                 height: 38px;
-                                background: Math.mod(idx, 2) == 0 ? #ffe3e3 : #e3f0ff;
-                                // column width, shared by the three columns
+                                background: row.id == root.sel-id ? #eaf1fd
+                                    : Math.mod(idx, 2) == 0 ? white : #f7f8fb;
                                 property <length> colw: (rowrect.width - 20px - 90px) / 2;
-
-                                Rectangle { // Original column
+                                Text { // Original column
                                     x: 10px;
-                                    y: 0;
                                     width: rowrect.colw;
                                     height: parent.height;
-                                    background: #d9f2d9;
-                                    Text {
-                                        width: parent.width;
-                                        height: parent.height;
-                                        text: row.original;
-                                        vertical-alignment: center;
-                                        horizontal-alignment: left;
-                                        overflow: elide;
-                                        color: #222;
-                                    }
+                                    text: row.original;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    color: #222;
                                 }
-                                Rectangle { // Translation column
+                                Text { // Translation column
                                     x: 10px + rowrect.colw;
-                                    y: 0;
                                     width: rowrect.colw;
                                     height: parent.height;
-                                    background: #fff3c4;
-                                    Text {
-                                        width: parent.width;
-                                        height: parent.height;
-                                        text: row.translation;
-                                        vertical-alignment: center;
-                                        horizontal-alignment: left;
-                                        overflow: elide;
-                                        color: #111;
-                                    }
+                                    text: row.translation;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    color: #111;
                                 }
-                                Rectangle { // Status column
+                                Text { // Status column
                                     x: 10px + rowrect.colw * 2;
-                                    y: 0;
                                     width: 90px;
                                     height: parent.height;
-                                    background: #ece0ff;
-                                    Text {
-                                        width: parent.width;
-                                        height: parent.height;
-                                        text: row.status == "" ? "pending" : row.status;
-                                        font-size: 11px;
-                                        vertical-alignment: center;
-                                        horizontal-alignment: left;
-                                        color: #555;
-                                    }
+                                    text: row.status == "" ? "pending" : row.status;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    color: #555;
                                 }
                                 TouchArea {
                                     clicked => { root.select-entry(row.id); }
@@ -537,6 +667,7 @@ export component AppWindow inherits Window {
                     border-radius: 4px;
                     HorizontalLayout {
                         padding-left: 8px;
+                        spacing: 4px; // matches the row delegates below
                         Text { text: "Source"; width: 200px; font-weight: 600; vertical-alignment: center; }
                         Text { text: "Translation"; width: 220px; font-weight: 600; vertical-alignment: center; }
                         Text { text: "Note"; font-weight: 600; vertical-alignment: center; }
@@ -642,10 +773,11 @@ export component AppWindow inherits Window {
                                     border-radius: 4px;
                                     HorizontalLayout {
                                         padding-left: 8px;
-                                        Text { text: "Name"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; }
+                                        spacing: 6px; // matches the row delegates below
+                                        Text { text: "Name"; width: 190px; font-weight: 600; vertical-alignment: center; overflow: elide; }
                                         Text { text: "Model"; width: 210px; font-weight: 600; vertical-alignment: center; overflow: elide; }
                                         Text { text: "Endpoint"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                        Text { text: ""; width: 132px; }
+                                        Text { text: ""; width: 90px; }
                                     }
                                 }
                                 ListView {
@@ -835,126 +967,240 @@ export component AppWindow inherits Window {
             }
         }
     }
-}
 
-// ============================================================ profile editor (modal)
+    // Delete-confirmation modal. Last child of the window so it renders
+    // on top of every tab.
+    if root.confirm-visible : ConfirmDialog {
+        width: root.width;
+        height: root.height;
+        title: root.confirm-title;
+        message: root.confirm-message;
+        accepted => { root.confirm-delete(); }
+        rejected => { root.cancel-delete(); }
+    }
 
-export component ProfileEditorWindow inherits Window {
-    title: "AI Profile";
-    icon: @image-url("assets/app-icon.png");
-    width: 780px;
-    height: 560px;
-    background: white;
-
-    in-out property <string> ed-name;
-    in-out property <int> ed-preset;
-    in-out property <string> ed-endpoint;
-    in-out property <string> ed-api-key;
-    in property <[string]> ed-model-items;
-    in-out property <int> ed-model-index;
-    in-out property <string> ed-model;
-    in-out property <string> ed-temperature;
-    in-out property <string> error;
-
-    callback ed-apply-preset(string);
-    callback ed-refresh-models();
-    callback ed-apply-model(string);
-    callback ed-confirm();
-    callback ed-cancel();
-
-    VerticalLayout {
-        padding: 16px;
-        spacing: 8px;
-
-        HorizontalLayout {
-            spacing: 8px;
+    // AI-profile add/edit form as a modal overlay, above everything else.
+    if root.ed-visible : Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #00000066;
+        TouchArea {} // swallow clicks — never close a half-edited form
+        Rectangle {
+            width: min(780px, parent.width - 40px);
+            height: min(560px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: white;
+            border-radius: 12px;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #00000045;
             VerticalLayout {
-                spacing: 2px;
-                horizontal-stretch: 1;
-                FieldLabel { text: "Profile Name"; }
-                LineEdit { text <=> root.ed-name; }
-            }
-            VerticalLayout {
-                spacing: 2px;
-                width: 170px;
-                FieldLabel { text: "Preset"; }
-                ComboBox {
-                    model: ["OpenAI (cloud)", "Ollama Cloud (API key)", "Ollama (local)", "LM Studio (local)", "OpenRouter", "Custom"];
-                    current-index <=> root.ed-preset;
-                    selected(text) => { root.ed-apply-preset(text); }
-                }
-            }
-        }
+                padding: 20px;
+                spacing: 8px;
 
-        VerticalLayout {
-            spacing: 2px;
-            FieldLabel { text: "API Endpoint (OpenAI-compatible)"; }
-            LineEdit { text <=> root.ed-endpoint; }
-        }
-
-        VerticalLayout {
-            spacing: 2px;
-            FieldLabel { text: "API Key (empty = not sent, for local servers)"; }
-            LineEdit { text <=> root.ed-api-key; input-type: password; }
-        }
-
-        HorizontalLayout {
-            spacing: 8px;
-            VerticalLayout {
-                spacing: 2px;
-                horizontal-stretch: 1;
-                FieldLabel { text: "Model (⟳ fetches the list from the server)"; }
                 HorizontalLayout {
-                    spacing: 4px;
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        model: root.ed-model-items;
-                        current-index <=> root.ed-model-index;
-                        selected(text) => { root.ed-apply-model(text); }
+                    spacing: 8px;
+                    Text {
+                        text: "AI Profile";
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
                     }
-                                    IconButton {
-                                        source: @image-url("assets/refresh.svg");
-                                        clicked => { root.ed-refresh-models(); }
-                                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    IconButton {
+                        source: @image-url("assets/x.svg");
+                        clicked => { root.ed-cancel(); }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        FieldLabel { text: "Profile Name"; }
+                        LineEdit { text <=> root.ed-name; }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        width: 170px;
+                        FieldLabel { text: "Preset"; }
+                        ComboBox {
+                            model: ["OpenAI (cloud)", "Ollama Cloud (API key)", "Ollama (local)", "LM Studio (local)", "OpenRouter", "Custom"];
+                            current-index <=> root.ed-preset;
+                            selected(text) => { root.ed-apply-preset(text); }
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 2px;
+                    FieldLabel { text: "API Endpoint (OpenAI-compatible)"; }
+                    LineEdit { text <=> root.ed-endpoint; }
+                }
+
+                VerticalLayout {
+                    spacing: 2px;
+                    FieldLabel { text: "API Key (empty = not sent, for local servers)"; }
+                    LineEdit { text <=> root.ed-api-key; input-type: password; }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        FieldLabel { text: "Model"; }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            ComboBox {
+                                horizontal-stretch: 1;
+                                model: root.ed-model-items;
+                                current-index <=> root.ed-model-index;
+                                selected(text) => { root.ed-apply-model(text); }
+                            }
+                            IconButton {
+                                source: @image-url("assets/refresh.svg");
+                                clicked => { root.ed-refresh-models(); }
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        width: 110px;
+                        FieldLabel { text: "Temperature"; }
+                        LineEdit {
+                            text <=> root.ed-temperature;
+                            input-type: number;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Thinking / reasoning is always disabled for Ollama providers.";
+                    font-size: 11px;
+                    color: #888;
+                }
+
+                if root.ed-error != "" : Text {
+                    text: root.ed-error;
+                    font-size: 12px;
+                    color: #c62828;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    DialogButton {
+                        label: "Confirm";
+                        primary: true;
+                        clicked => { root.ed-confirm(); }
+                    }
+                    DialogButton {
+                        label: "Cancel";
+                        clicked => { root.ed-cancel(); }
+                    }
                 }
             }
+        }
+    }
+
+    // Folder picker overlay — replaces the native file dialog.
+    // "" in fp-path means the drive list.
+    if root.fp-visible : Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #00000066;
+        TouchArea {} // swallow clicks — pickers close via their buttons
+        Rectangle {
+            width: min(640px, parent.width - 40px);
+            height: min(460px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: white;
+            border-radius: 12px;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #00000045;
             VerticalLayout {
-                spacing: 2px;
-                width: 110px;
-                FieldLabel { text: "Temperature"; }
-                LineEdit {
-                    text <=> root.ed-temperature;
-                    input-type: number;
+                padding: 20px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Select the game folder";
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    IconButton {
+                        source: @image-url("assets/x.svg");
+                        clicked => { root.fp-cancel(); }
+                    }
                 }
-            }
-        }
 
-        Text {
-            text: "Thinking / reasoning is always disabled for Ollama providers.";
-            font-size: 11px;
-            color: #888;
-        }
+                HorizontalLayout {
+                    spacing: 6px;
+                    LineEdit {
+                        text <=> root.fp-path;
+                        horizontal-stretch: 1;
+                        placeholder-text: "Type a path (e.g. D:\\Games) and press Enter";
+                        accepted(text) => { root.fp-go(); }
+                    }
+                    DialogButton {
+                        label: "Go";
+                        clicked => { root.fp-go(); }
+                    }
+                }
 
-        if root.error != "" : Text {
-            text: root.error;
-            font-size: 12px;
-            color: #c62828;
-            wrap: word-wrap;
-        }
+                Rectangle {
+                    clip: true;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: #e2e4ea;
+                    vertical-stretch: 1;
+                    ListView {
+                        for item in root.fp-items: Rectangle {
+                            height: 30px;
+                            ta := TouchArea {
+                                clicked => { root.fp-navigate(item); }
+                                mouse-cursor: pointer;
+                            }
+                            background: ta.has-hover ? #eef2fb : transparent;
+                            Text {
+                                x: 10px;
+                                text: item;
+                                vertical-alignment: center;
+                                color: item == ".." ? #888 : #333;
+                            }
+                        }
+                    }
+                }
 
-        Rectangle { vertical-stretch: 1; }
+                if root.fp-status != "" : Text {
+                    text: root.fp-status;
+                    font-size: 12px;
+                    color: #c62828;
+                    overflow: elide;
+                }
 
-        HorizontalLayout {
-            alignment: end;
-            spacing: 8px;
-            Button {
-                text: "Confirm";
-                primary: true;
-                clicked => { root.ed-confirm(); }
-            }
-            Button {
-                text: "Cancel";
-                clicked => { root.ed-cancel(); }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    DialogButton {
+                        label: "Use This Folder";
+                        primary: true;
+                        clicked => { root.fp-confirm(); }
+                    }
+                    DialogButton {
+                        label: "Cancel";
+                        clicked => { root.fp-cancel(); }
+                    }
+                }
             }
         }
     }

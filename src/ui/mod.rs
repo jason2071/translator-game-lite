@@ -3,9 +3,9 @@
 //! Windows:
 //! - `AppWindow` — main window with the Project / Glossary / Settings tabs
 //!   (heavy work on background threads, results pushed back via
-//!   `upgrade_in_event_loop`).
-//! - `ProfileEditorWindow` — modal to create/edit one AI profile
-//!   (endpoint / key / model / temperature), applied on Confirm.
+//!   `upgrade_in_event_loop`), plus in-app overlays: the delete-confirmation
+//!   dialog and the AI-profile add/edit form (endpoint / key / model /
+//!   temperature), applied on Confirm.
 //!
 //! Settings fields auto-save into SQLite on every edit, so the translate
 //! flows always read the current values from the DB.
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use slint::{ComponentHandle, LogicalPosition, ModelRc, SharedString, VecModel, WindowPosition};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::ai::{OpenAiCompatibleProvider, ProviderConfig, TranslationProvider as _};
 use crate::core::context::ContextWindow;
@@ -35,7 +35,6 @@ const PAGE_SIZE: usize = 200;
 
 pub fn run(db: Arc<Db>) -> Result<()> {
     let app = AppWindow::new()?;
-    let editor = ProfileEditorWindow::new()?;
     let cancel = Arc::new(AtomicBool::new(false));
 
     // Repair stray spaces older runs may have saved.
@@ -49,7 +48,7 @@ pub fn run(db: Arc<Db>) -> Result<()> {
         refresh_glossary(&app, &db);
     }
     wire_app_callbacks(&app, db.clone(), cancel);
-    wire_settings_callbacks(&app, &editor, db);
+    wire_settings_callbacks(&app, db);
     let _ = app.show();
     let _ = app.run()?;
     Ok(())
@@ -369,22 +368,27 @@ fn refresh_profile_pickers(ui: &AppWindow, db: &Db) {
     ui.set_glossary_profile_index(index_for(crate::database::PURPOSE_GLOSSARY));
 }
 
-/// Open the profile editor centered over the main window.
-fn show_editor_centered(app: &AppWindow, editor: &ProfileEditorWindow) {
-    let scale = app.window().scale_factor();
-    let size = app.window().size();
-    let pos = app.window().position();
-    let logical_w = size.width as f32 / scale;
-    let logical_h = size.height as f32 / scale;
-    let x = pos.x as f32 / scale + ((logical_w - 780.0) / 2.0).max(0.0);
-    let y = pos.y as f32 / scale + ((logical_h - 560.0) / 2.0).max(0.0);
-    editor
-        .window()
-        .set_position(WindowPosition::Logical(LogicalPosition::new(x, y)));
-    let _ = editor.show();
+fn perform_profile_delete(ui: &AppWindow, db: &Db, id: &str) {
+    let _ = db.ai_profile_delete(id);
+    // Repoint any purpose that referenced the deleted profile.
+    let remaining = db.ai_profile_list().unwrap_or_default();
+    if let Some(first) = remaining.first() {
+        for key in [
+            crate::database::PURPOSE_TRANSLATION,
+            crate::database::PURPOSE_GLOSSARY,
+        ] {
+            let cur = db.setting_get(key).ok().flatten().unwrap_or_default();
+            if cur.as_str() == id {
+                let _ = db.setting_set(key, &first.id);
+            }
+        }
+    }
+    refresh_profiles(ui, db);
+    refresh_profile_pickers(ui, db);
+    ui.set_status_message("Profile deleted.".into());
 }
 
-fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc<Db>) {
+fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
     // Shared state: which profile the editor modal is working on
     // (None = creating a new one).
     let editing: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -394,42 +398,59 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
         let weak = ui.as_weak();
         let db = db.clone();
         ui.on_profile_delete(move |id| {
-            let confirmed = rfd::MessageDialog::new()
-                .set_title("Delete profile")
-                .set_description("Delete this AI profile? The pages using it will fall back to another profile.")
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show();
-            if confirmed != rfd::MessageDialogResult::Yes {
-                return;
-            }
-            let _ = db.ai_profile_delete(&id);
-            // Repoint any purpose that referenced the deleted profile.
-            let remaining = db.ai_profile_list().unwrap_or_default();
-            if let Some(first) = remaining.first() {
-                for key in [
-                    crate::database::PURPOSE_TRANSLATION,
-                    crate::database::PURPOSE_GLOSSARY,
-                ] {
-                    let cur = db.setting_get(key).ok().flatten().unwrap_or_default();
-                    if cur.as_str() == id.as_str() {
-                        let _ = db.setting_set(key, &first.id);
+            let Some(ui) = weak.upgrade() else { return };
+            let name = db
+                .ai_profile_get(&id)
+                .ok()
+                .flatten()
+                .map(|p| p.name)
+                .unwrap_or_else(|| "this profile".into());
+            ui.set_confirm_kind("profile".into());
+            ui.set_confirm_pending_id(id.clone());
+            ui.set_confirm_title("Delete profile".into());
+            ui.set_confirm_message(
+                format!("Delete \u{201c}{name}\u{201d}? Pages using it will fall back to another profile.")
+                    .into(),
+            );
+            ui.set_confirm_visible(true);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_confirm_delete(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let id = ui.get_confirm_pending_id();
+            match ui.get_confirm_kind().as_str() {
+                "glossary" => {
+                    let _ = db.glossary_delete(&id);
+                    if ui.get_gl_id() == id {
+                        ui.set_gl_id("".into());
                     }
+                    refresh_glossary(&ui, &db);
+                    ui.set_status_message("Glossary entry deleted.".into());
                 }
+                _ => perform_profile_delete(&ui, &db, &id),
             }
-            refresh_profiles(&weak.upgrade().unwrap(), &db);
-            refresh_profile_pickers(&weak.upgrade().unwrap(), &db);
+            ui.set_confirm_visible(false);
+            ui.set_confirm_pending_id("".into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_cancel_delete(move || {
             if let Some(ui) = weak.upgrade() {
-                ui.set_status_message("Profile deleted.".into());
+                ui.set_confirm_visible(false);
+                ui.set_confirm_pending_id("".into());
             }
         });
     }
     {
-        let app_weak = ui.as_weak();
-        let editor_weak = editor.as_weak();
+        let weak = ui.as_weak();
         let db = db.clone();
         let editing_weak = Arc::clone(&editing);
         ui.on_profile_add(move || {
-            let Some(editor) = editor_weak.upgrade() else { return };
+            let Some(ui) = weak.upgrade() else { return };
             let profiles = db.ai_profile_list().unwrap_or_default();
             let mut n = profiles.len() + 1;
             while profiles
@@ -439,59 +460,54 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
                 n += 1;
             }
             let endpoint = "https://api.openai.com/v1";
-            editor.set_ed_name(format!("Profile {n}").into());
-            editor.set_ed_preset(0);
-            editor.set_ed_endpoint(endpoint.into());
-            editor.set_ed_api_key(String::new().into());
+            ui.set_ed_name(format!("Profile {n}").into());
+            ui.set_ed_preset(0);
+            ui.set_ed_endpoint(endpoint.into());
+            ui.set_ed_api_key(String::new().into());
             let model = default_model_for("openai").to_string();
-            editor.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
+            ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
                 model.clone(),
             )]))));
-            editor.set_ed_model_index(0);
-            editor.set_ed_model(model.into());
-            editor.set_ed_temperature("0.3".into());
-            editor.set_error(String::new().into());
+            ui.set_ed_model_index(0);
+            ui.set_ed_model(model.into());
+            ui.set_ed_temperature("0.3".into());
+            ui.set_ed_error(String::new().into());
             *editing_weak.lock().unwrap() = None;
-            if let Some(app) = app_weak.upgrade() {
-                show_editor_centered(&app, &editor);
-            }
+            ui.set_ed_visible(true);
         });
     }
     {
-        let app_weak = ui.as_weak();
-        let editor_weak = editor.as_weak();
+        let weak = ui.as_weak();
         let db = db.clone();
         let editing_weak = Arc::clone(&editing);
         ui.on_profile_edit(move |id| {
-            let Some(editor) = editor_weak.upgrade() else { return };
+            let Some(ui) = weak.upgrade() else { return };
             let Some(p) = db.ai_profile_get(&id).ok().flatten() else { return };
-            editor.set_ed_name(p.name.clone().into());
-            editor.set_ed_preset(preset_index_for(&p.endpoint));
-            editor.set_ed_endpoint(p.endpoint.clone().into());
-            editor.set_ed_api_key(p.api_key.clone().into());
+            ui.set_ed_name(p.name.clone().into());
+            ui.set_ed_preset(preset_index_for(&p.endpoint));
+            ui.set_ed_endpoint(p.endpoint.clone().into());
+            ui.set_ed_api_key(p.api_key.clone().into());
             let model = if p.model.trim().is_empty() {
                 model_for_endpoint(&db, &p.endpoint)
             } else {
                 p.model.clone()
             };
-            editor.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
+            ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
                 model.clone(),
             )]))));
-            editor.set_ed_model_index(0);
-            editor.set_ed_model(model.into());
-            editor.set_ed_temperature(format!("{:.2}", p.temperature).into());
-            editor.set_error(String::new().into());
+            ui.set_ed_model_index(0);
+            ui.set_ed_model(model.into());
+            ui.set_ed_temperature(format!("{:.2}", p.temperature).into());
+            ui.set_ed_error(String::new().into());
             *editing_weak.lock().unwrap() = Some(p.id.clone());
-            if let Some(app) = app_weak.upgrade() {
-                show_editor_centered(&app, &editor);
-            }
+            ui.set_ed_visible(true);
         });
     }
 
     // ---------------------------------------------------- profile modal
     {
-        let weak = editor.as_weak();
-        editor.on_ed_apply_preset(move |name| {
+        let weak = ui.as_weak();
+        ui.on_ed_apply_preset(move |name| {
             let Some(ui) = weak.upgrade() else { return };
             let endpoint = match name.as_str() {
                 "OpenAI (cloud)" => "https://api.openai.com/v1",
@@ -506,8 +522,8 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
         });
     }
     {
-        let weak = editor.as_weak();
-        editor.on_ed_refresh_models(move || {
+        let weak = ui.as_weak();
+        ui.on_ed_refresh_models(move || {
             let Some(ui) = weak.upgrade() else { return };
             let provider = OpenAiCompatibleProvider::new(ProviderConfig {
                 endpoint: ui.get_ed_endpoint().trim().to_string(),
@@ -525,7 +541,7 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
                         models.sort();
                         models.dedup();
                         if models.is_empty() {
-                            ui.set_error("The provider returned no models — check the endpoint/API key.".into());
+                            ui.set_ed_error("The provider returned no models — check the endpoint/API key.".into());
                             return;
                         }
                         if !current.is_empty() && !models.iter().any(|m| *m == current) {
@@ -537,34 +553,33 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
                             models.into_iter().map(SharedString::from).collect();
                         ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(items))));
                         ui.set_ed_model_index(index as i32);
-                        ui.set_error(String::new().into());
+                        ui.set_ed_error(String::new().into());
                     }
-                    Err(e) => ui.set_error(format!("{e:#}").into()),
+                    Err(e) => ui.set_ed_error(format!("{e:#}").into()),
                 });
             });
         });
     }
     {
-        let weak = editor.as_weak();
-        editor.on_ed_apply_model(move |model| {
+        let weak = ui.as_weak();
+        ui.on_ed_apply_model(move |model| {
             let Some(ui) = weak.upgrade() else { return };
             ui.set_ed_model(model);
         });
     }
     {
-        let weak = editor.as_weak();
-        editor.on_ed_cancel(move || {
+        let weak = ui.as_weak();
+        ui.on_ed_cancel(move || {
             if let Some(ui) = weak.upgrade() {
-                let _ = ui.hide();
+                ui.set_ed_visible(false);
             }
         });
     }
     {
-        let weak = editor.as_weak();
-        let settings_weak = ui.as_weak();
+        let weak = ui.as_weak();
         let db = db.clone();
         let editing_weak = Arc::clone(&editing);
-        editor.on_ed_confirm(move || {
+        ui.on_ed_confirm(move || {
             let Some(ui) = weak.upgrade() else { return };
             let name = ui.get_ed_name().trim().to_string();
             let endpoint = ui.get_ed_endpoint().trim().to_string();
@@ -577,15 +592,15 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
                 .unwrap_or(f32::NAN);
 
             if name.is_empty() {
-                ui.set_error("Profile name is empty.".into());
+                ui.set_ed_error("Profile name is empty.".into());
                 return;
             }
             if endpoint.is_empty() {
-                ui.set_error("API endpoint is empty.".into());
+                ui.set_ed_error("API endpoint is empty.".into());
                 return;
             }
             if temperature.is_nan() || !(0.0..=2.0).contains(&temperature) {
-                ui.set_error("Temperature must be a number between 0.0 and 2.0.".into());
+                ui.set_ed_error("Temperature must be a number between 0.0 and 2.0.".into());
                 return;
             }
             let editing_id = editing_weak.lock().unwrap().clone();
@@ -598,7 +613,7 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
                         && editing_id.as_deref() != Some(p.id.as_str())
                 });
             if dup {
-                ui.set_error(format!("A profile named \"{name}\" already exists.").into());
+                ui.set_ed_error(format!("A profile named \"{name}\" already exists.").into());
                 return;
             }
 
@@ -614,19 +629,17 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
                 updated_at: now,
             };
             if db.ai_profile_upsert(&profile).is_err() {
-                ui.set_error("Could not save the profile.".into());
+                ui.set_ed_error("Could not save the profile.".into());
                 return;
             }
             // First profile becomes the active one.
             if db.setting_get("active_profile_translation").ok().flatten().is_none() {
                 let _ = db.setting_set("active_profile_translation", &profile.id);
             }
-            let _ = ui.hide();
-            if let Some(s) = settings_weak.upgrade() {
-                refresh_profiles(&s, &db);
-                refresh_profile_pickers(&s, &db);
-                s.set_status_message(format!("Profile \"{}\" saved.", profile.name).into());
-            }
+            ui.set_ed_visible(false);
+            refresh_profiles(&ui, &db);
+            refresh_profile_pickers(&ui, &db);
+            ui.set_status_message(format!("Profile \"{}\" saved.", profile.name).into());
         });
     }
 
@@ -721,39 +734,133 @@ fn wire_settings_callbacks(ui: &AppWindow, editor: &ProfileEditorWindow, db: Arc
 
 // --------------------------------------------------------- app callbacks
 
+/// Trim a trailing separator (drive roots like `C:\` keep theirs).
+fn fp_normalize(p: &Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    let trimmed = s.trim_end_matches(['/', '\\']);
+    if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+        format!("{trimmed}\\")
+    } else if trimmed.is_empty() {
+        s
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Read the directory listing shown by the folder picker: subdirectories
+/// only, ".." first. An empty path lists available drives.
+fn fp_load_dir(ui: &AppWindow, target: &str) {
+    let target = target.trim();
+    let (path_text, mut names, error) = if target.is_empty() {
+        let drives: Vec<String> = (b'A'..=b'Z')
+            .map(|b| format!("{}:\\", b as char))
+            .filter(|d| Path::new(d).is_dir())
+            .collect();
+        (String::new(), drives, String::new())
+    } else {
+        match std::fs::read_dir(target) {
+            Ok(entries) => {
+                let mut dirs: Vec<String> = entries
+                    .flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| !n.starts_with('.'))
+                    .collect();
+                dirs.sort_by_key(|a| a.to_lowercase());
+                (target.to_string(), dirs, String::new())
+            }
+            Err(e) => (
+                target.to_string(),
+                Vec::new(),
+                format!("Cannot open folder: {e}"),
+            ),
+        }
+    };
+    if !target.is_empty() && error.is_empty() {
+        names.insert(0, "..".to_string());
+    }
+    let items: Vec<SharedString> = names.into_iter().map(SharedString::from).collect();
+    ui.set_fp_path(path_text.into());
+    ui.set_fp_items(ModelRc::from(Rc::new(VecModel::from(items))));
+    ui.set_fp_status(error.into());
+}
+
 fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
-    // --- Browse: pick folder -> detect engine -> create/load project -> scan
+    // --- Browse: open the in-app folder picker; picking a folder then
+    //     detects the engine, creates/loads the project and scans it.
+    {
+        let weak = ui.as_weak();
+        ui.on_browse_project(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            // Start next to the current project, else in the home directory.
+            let start = match ui.get_project_path().to_string() {
+                p if !p.is_empty() => Path::new(&p)
+                    .parent()
+                    .map(fp_normalize)
+                    .unwrap_or_default(),
+                _ => dirs::home_dir().map(|p| fp_normalize(&p)).unwrap_or_default(),
+            };
+            fp_load_dir(&ui, &start);
+            ui.set_fp_visible(true);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_fp_navigate(move |name| {
+            let Some(ui) = weak.upgrade() else { return };
+            let cur = ui.get_fp_path().to_string();
+            let target = if name.as_str() == ".." {
+                Path::new(&cur).parent().map(fp_normalize).unwrap_or_default()
+            } else if cur.is_empty() {
+                name.to_string() // a drive root like "C:\"
+            } else {
+                fp_normalize(&Path::new(&cur).join(name.as_str()))
+            };
+            fp_load_dir(&ui, &target);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_fp_go(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let text = ui.get_fp_path().trim().to_string();
+            fp_load_dir(&ui, &text);
+        });
+    }
     {
         let weak = ui.as_weak();
         let db = db.clone();
-        ui.on_browse_project(move || {
+        ui.on_fp_confirm(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let dir = ui.get_fp_path().trim().to_string();
+            if dir.is_empty() {
+                ui.set_fp_status("Choose a drive first.".into());
+                return;
+            }
+            if !Path::new(&dir).is_dir() {
+                ui.set_fp_status("That path is not a folder.".into());
+                return;
+            }
+            ui.set_fp_visible(false);
             let ui_weak = weak.clone();
             let db = db.clone();
             std::thread::spawn(move || {
-                let picked = rfd::FileDialog::new()
-                    .set_title("Select the game folder")
-                    .pick_folder();
-                let Some(path) = picked else { return };
-                let engine = match detect_engine(&path) {
+                let engine = match detect_engine(Path::new(&dir)) {
                     Some(engine) => engine,
                     None => {
                         let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                             ui.set_status_message(
-                                format!(
-                                    "No supported game engine found in {}",
-                                    path.display()
-                                )
-                                .into(),
+                                format!("No supported game engine found in {dir}").into(),
                             );
                         });
                         return;
                     }
                 };
-                let name = path
+                let name = Path::new(&dir)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Game".to_string());
-                let project = Project::new(name, path.to_string_lossy(), engine.id());
+                let project = Project::new(name, dir, engine.id());
 
                 let scan =
                     (|| -> anyhow::Result<(Project, crate::database::ScanReport)> {
@@ -787,6 +894,14 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                     }
                 });
             });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_fp_cancel(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_fp_visible(false);
+            }
         });
     }
 
@@ -1189,11 +1304,17 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_glossary_delete(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let _ = db.glossary_delete(&id);
-            if ui.get_gl_id() == id {
-                ui.set_gl_id("".into());
-            }
-            refresh_glossary(&ui, &db);
+            let label = db
+                .glossary_get(&id)
+                .ok()
+                .flatten()
+                .map(|g| format!("{} \u{2192} {}", g.source, g.target))
+                .unwrap_or_else(|| "this entry".into());
+            ui.set_confirm_kind("glossary".into());
+            ui.set_confirm_pending_id(id.clone());
+            ui.set_confirm_title("Delete glossary entry".into());
+            ui.set_confirm_message(format!("Delete \u{201c}{label}\u{201d}?").into());
+            ui.set_confirm_visible(true);
         });
     }
     {
