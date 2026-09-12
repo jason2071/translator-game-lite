@@ -126,6 +126,21 @@ fn refresh_glossary(ui: &AppWindow, db: &Db) {
     ui.set_glossary(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
+fn refresh_proposals(ui: &AppWindow, db: &Db) {
+    let rows = current_project(db)
+        .and_then(|p| db.glossary_proposals_list(&p.id).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| GlossaryProposalRow {
+            id: p.id.into(),
+            source: p.source.into(),
+            target: p.target.into(),
+            occurrences: p.occurrences as i32,
+        })
+        .collect::<Vec<_>>();
+    ui.set_gp_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
 fn load_entry_detail(ui: &AppWindow, db: &Db, id: &str) {
     let Some(project) = current_project(db) else { return };
     let Some(entry) = db.source_by_id(id).ok().flatten() else { return };
@@ -1236,6 +1251,111 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                     }
                 });
             });
+        });
+    }
+
+    // --- AI glossary extraction
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_extract_glossary(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            ui.set_gp_busy(true);
+            ui.set_gp_status("".into());
+            ui.set_status_message("Extracting glossary: mining candidate terms…".into());
+            let ui_weak = weak.clone();
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<usize> {
+                    let texts = db.all_source_texts(&project.id)?;
+                    let candidates = crate::glossary_ai::mine_candidates(&texts, 120);
+                    if candidates.is_empty() {
+                        return Ok(0);
+                    }
+                    let provider = build_provider(&db, crate::database::PURPOSE_GLOSSARY);
+                    let lang = project_language(&db);
+                    let proposals = crate::glossary_ai::propose_glossary(
+                        &provider, &lang, &candidates, 50,
+                    )?;
+                    db.glossary_proposals_replace(&project.id, &proposals)
+                })();
+                let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_gp_busy(false);
+                    match result {
+                        Ok(count) if count > 0 => {
+                            refresh_proposals(&ui, &db);
+                            ui.set_gp_visible(true);
+                            ui.set_status_message(
+                                format!("{count} glossary proposals ready for review.").into(),
+                            );
+                        }
+                        Ok(_) => ui.set_status_message(
+                            "AI found no new glossary terms.".into(),
+                        ),
+                        Err(e) => ui.set_status_message(
+                            format!("Glossary extraction failed: {e:#}").into(),
+                        ),
+                    }
+                });
+            });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_gp_accept(move |id| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            let proposals = db.glossary_proposals_list(&project.id).unwrap_or_default();
+            if let Some(p) = proposals.iter().find(|p| p.id == id.as_str()) {
+                let _ = db.glossary_add(&project.id, &p.source, &p.target, None);
+                let _ = db.glossary_proposals_delete(&id);
+                refresh_glossary(&ui, &db);
+                refresh_proposals(&ui, &db);
+                ui.set_status_message(format!("Added \"{}\" to glossary.", p.source).into());
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_gp_reject(move |id| {
+            let Some(ui) = weak.upgrade() else { return };
+            let _ = db.glossary_proposals_delete(&id);
+            refresh_proposals(&ui, &db);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_gp_accept_all(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            let proposals = db.glossary_proposals_list(&project.id).unwrap_or_default();
+            let mut added = 0;
+            for p in &proposals {
+                if db.glossary_add(&project.id, &p.source, &p.target, None).is_ok() {
+                    added += 1;
+                }
+            }
+            let _ = db.glossary_proposals_clear(&project.id);
+            refresh_glossary(&ui, &db);
+            refresh_proposals(&ui, &db);
+            ui.set_gp_visible(false);
+            ui.set_status_message(format!("Added {added} terms to glossary.").into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_gp_discard(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            let _ = db.glossary_proposals_clear(&project.id);
+            refresh_proposals(&ui, &db);
+            ui.set_gp_visible(false);
+            ui.set_status_message("Glossary proposals discarded.".into());
         });
     }
 

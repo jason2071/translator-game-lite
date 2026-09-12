@@ -54,6 +54,14 @@ pub struct ProjectStats {
 pub const PURPOSE_TRANSLATION: &str = "translation_profile_id";
 pub const PURPOSE_GLOSSARY: &str = "glossary_profile_id";
 
+/// One AI-proposed glossary term awaiting user review.
+pub struct GlossaryProposal {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub occurrences: usize,
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
     #[allow(dead_code)]
@@ -477,6 +485,102 @@ impl Db {
         Ok(rows)
     }
 
+    // ------------------------------------------------- glossary proposals (AI)
+
+    /// Distinct source texts of a project — the corpus for glossary mining.
+    pub fn all_source_texts(&self, project_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT source_text FROM sources WHERE project_id = ?1")?;
+        let rows = stmt
+            .query_map(params![project_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Replace all AI proposals for a project with a new batch, skipping
+    /// terms that are already in the project's glossary. Returns how many
+    /// rows were actually inserted.
+    pub fn glossary_proposals_replace(
+        &self,
+        project_id: &str,
+        proposals: &[crate::glossary_ai::Proposal],
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM glossary_proposals WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt =
+                conn.prepare("SELECT source_term FROM glossary WHERE project_id = ?1")?;
+            let rows = stmt
+                .query_map(params![project_id], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter().map(|s| s.to_lowercase()).collect()
+        };
+        let now = crate::core::project::now_unix();
+        let mut inserted = 0;
+        for p in proposals {
+            if existing.contains(&p.source.to_lowercase()) {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO glossary_proposals
+                     (id, project_id, source_term, target_term, occurrences, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    crate::core::project::new_id(),
+                    project_id,
+                    p.source,
+                    p.target,
+                    p.occurrences as i64,
+                    now
+                ],
+            )?;
+            inserted += 1;
+        }
+        Ok(inserted)
+    }
+
+    pub fn glossary_proposals_list(&self, project_id: &str) -> Result<Vec<GlossaryProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_term, target_term, occurrences
+             FROM glossary_proposals WHERE project_id = ?1
+             ORDER BY occurrences DESC, source_term COLLATE NOCASE",
+        )?;
+        let rows = stmt
+            .query_map(params![project_id], |r| {
+                Ok(GlossaryProposal {
+                    id: r.get(0)?,
+                    source: r.get(1)?,
+                    target: r.get(2)?,
+                    occurrences: r.get::<_, i64>(3)? as usize,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn glossary_proposals_delete(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM glossary_proposals WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn glossary_proposals_clear(&self, project_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM glossary_proposals WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(())
+    }
+
     // ---------------------------------------------------- translation memory
 
     pub fn memory_get(&self, source_hash: &str, target_language: &str) -> Result<Option<String>> {
@@ -766,6 +870,17 @@ fn migrate(conn: &Connection) -> Result<()> {
             enabled INTEGER NOT NULL DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS idx_glossary_project ON glossary(project_id);
+
+        CREATE TABLE IF NOT EXISTS glossary_proposals (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            source_term TEXT NOT NULL,
+            target_term TEXT NOT NULL,
+            occurrences INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_glossary_proposals_project
+            ON glossary_proposals(project_id);
 
         CREATE TABLE IF NOT EXISTS translation_memory (
             source_hash TEXT NOT NULL,

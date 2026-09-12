@@ -17,6 +17,13 @@ export struct GlossaryRow {
     enabled: bool,
 }
 
+export struct GlossaryProposalRow {
+    id: string,
+    source: string,
+    target: string,
+    occurrences: int,
+}
+
 export struct ContextInfo {
     speaker: string,
     scene: string,
@@ -79,8 +86,10 @@ component FieldLabel inherits Text {
 /// Square icon button (refresh, close, add, edit, delete, ...).
 component IconButton inherits Rectangle {
     in property <image> source;
+    in property <bool> enabled: true;
     callback clicked();
     border-radius: 6px;
+    opacity: root.enabled ? 1 : 0.35;
     background: ta.has-hover ? #e4e8f2 : transparent;
     min-width: 30px;
     max-width: 30px;
@@ -89,6 +98,7 @@ component IconButton inherits Rectangle {
     horizontal-stretch: 0;
     vertical-stretch: 0;
     ta := TouchArea {
+        enabled: root.enabled;
         clicked => { root.clicked(); }
         mouse-cursor: pointer;
     }
@@ -139,16 +149,19 @@ component DialogButton inherits Rectangle {
     in property <string> label;
     in property <bool> danger;
     in property <bool> primary;
+    in property <bool> enabled: true;
     callback clicked();
     height: 34px;
     min-width: 96px;
     border-radius: 7px;
+    opacity: root.enabled ? 1 : 0.45;
     background: root.danger
         ? (ta.pressed ? #b91c1c : ta.has-hover ? #dc2626 : #ef4444)
         : root.primary
             ? (ta.pressed ? #174a9f : ta.has-hover ? #1a55bd : #1c5fd6)
             : (ta.pressed ? #d8dbe3 : ta.has-hover ? #e4e7ee : #eef0f5);
     ta := TouchArea {
+        enabled: root.enabled;
         clicked => { root.clicked(); }
         mouse-cursor: pointer;
     }
@@ -269,6 +282,10 @@ export component AppWindow inherits Window {
     in-out property <string> gl-source;
     in-out property <string> gl-target;
     in-out property <string> gl-note;
+    in property <[GlossaryProposalRow]> gp-rows;
+    in-out property <bool> gp-visible;
+    in-out property <bool> gp-busy; // AI extraction in progress
+    in-out property <string> gp-status;
 
     // ---- settings / AI profiles
     in-out property <int> section; // 0 = AI Profiles, 1 = Translation, 2 = Prompt
@@ -355,6 +372,11 @@ export component AppWindow inherits Window {
     callback fp-go();
     callback fp-confirm();
     callback fp-cancel();
+    callback extract-glossary();
+    callback gp-accept(string);
+    callback gp-reject(string);
+    callback gp-accept-all();
+    callback gp-discard();
 
     VerticalLayout {
         // ================================================== header / toolbar
@@ -641,6 +663,17 @@ export component AppWindow inherits Window {
                         model: root.glossary-profile-items;
                         current-index <=> root.glossary-profile-index;
                         selected(text) => { root.pick-glossary-profile(text); }
+                    }
+                    IconButton {
+                        source: @image-url("assets/wand.svg");
+                        enabled: root.project-path != "" && !root.gp-busy;
+                        clicked => { root.extract-glossary(); }
+                    }
+                    Text {
+                        text: "Extract with AI";
+                        font-size: 11px;
+                        color: #777;
+                        vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
                     IconButton {
@@ -1192,13 +1225,137 @@ export component AppWindow inherits Window {
                     alignment: end;
                     spacing: 8px;
                     DialogButton {
-                        label: "Use This Folder";
+                        label: "Select Folder";
                         primary: true;
                         clicked => { root.fp-confirm(); }
                     }
                     DialogButton {
                         label: "Cancel";
                         clicked => { root.fp-cancel(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // AI glossary proposals review overlay.
+    if root.gp-visible : Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #00000066;
+        TouchArea {} // swallow clicks — review closes via its buttons
+        Rectangle {
+            width: min(720px, parent.width - 40px);
+            height: min(520px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: white;
+            border-radius: 12px;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #00000045;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "AI Glossary Proposals";
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.gp-rows.length + " terms";
+                        font-size: 12px;
+                        color: #888;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    IconButton {
+                        source: @image-url("assets/x.svg");
+                        clicked => { root.gp-visible = false; } // keep for later
+                    }
+                }
+
+                Rectangle {
+                    height: 26px;
+                    background: #eef0f5;
+                    border-radius: 4px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        spacing: 4px; // matches the row delegates below
+                        Text { text: "Term"; width: 240px; font-weight: 600; vertical-alignment: center; }
+                        Text { text: "Translation"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; }
+                        Text { text: "Freq"; width: 50px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: ""; width: 76px; }
+                    }
+                }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for p[ix] in root.gp-rows: Rectangle {
+                        height: 34px;
+                        background: Math.mod(ix, 2) == 0 ? white : #f7f8fb;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                spacing: 4px;
+                                Text { text: p.source; width: 240px; overflow: elide; vertical-alignment: center; }
+                                Text { text: p.target; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                                Text {
+                                    text: p.occurrences;
+                                    width: 50px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    font-size: 12px;
+                                    color: #888;
+                                }
+                                Rectangle {
+                                    width: 76px;
+                                    HorizontalLayout {
+                                        alignment: center;
+                                        spacing: 4px;
+                                        IconButton {
+                                            source: @image-url("assets/check.svg");
+                                            clicked => { root.gp-accept(p.id); }
+                                        }
+                                        IconButton {
+                                            source: @image-url("assets/trash.svg");
+                                            clicked => { root.gp-reject(p.id); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                if root.gp-rows.length == 0 : Text {
+                    text: "No proposals. Run Extract with AI from the Glossary page.";
+                    color: #888;
+                    horizontal-alignment: center;
+                }
+
+                if root.gp-status != "" : Text {
+                    text: root.gp-status;
+                    font-size: 12px;
+                    color: #c62828;
+                    overflow: elide;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    DialogButton {
+                        label: "Accept All";
+                        primary: true;
+                        enabled: root.gp-rows.length > 0;
+                        clicked => { root.gp-accept-all(); }
+                    }
+                    DialogButton {
+                        label: "Discard";
+                        danger: true;
+                        enabled: root.gp-rows.length > 0;
+                        clicked => { root.gp-discard(); }
                     }
                 }
             }
