@@ -64,9 +64,21 @@ mod tests {
         // The policy "automatic translation never overwrites Translated or
         // Edited" is enforced by the pending-entries query, which only
         // selects 'pending' and 'failed'.
-        assert_eq!(TranslationStatus::from_str("pending"), TranslationStatus::Pending);
-        assert_eq!(TranslationStatus::from_str("failed"), TranslationStatus::Failed);
-        assert_ne!(TranslationStatus::from_str("pending"), TranslationStatus::Edited);
-        assert_ne!(TranslationStatus::from_str("pending"), TranslationStatus::Translated);
+        assert_eq!(
+            TranslationStatus::from_str("pending"),
+            TranslationStatus::Pending
+        );
+        assert_eq!(
+            TranslationStatus::from_str("failed"),
+            TranslationStatus::Failed
+        );
+        assert_ne!(
+            TranslationStatus::from_str("pending"),
+            TranslationStatus::Edited
+        );
+        assert_ne!(
+            TranslationStatus::from_str("pending"),
+            TranslationStatus::Translated
+        );
     }
 }

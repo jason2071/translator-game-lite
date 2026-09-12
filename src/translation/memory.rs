@@ -15,11 +15,7 @@ pub fn lookup(db: &Db, source_hash: &str, target_language: &str) -> Result<Optio
 
 /// Store finished translations in one transaction.
 /// `rows`: (source_hash, source_text, translated_text).
-pub fn store(
-    db: &Db,
-    rows: &[(String, String, String)],
-    target_language: &str,
-) -> Result<()> {
+pub fn store(db: &Db, rows: &[(String, String, String)], target_language: &str) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }

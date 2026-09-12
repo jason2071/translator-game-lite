@@ -1,3 +1,3 @@
 pub mod sqlite;
 
-pub use sqlite::{AiProfile, Db, PURPOSE_GLOSSARY, PURPOSE_TRANSLATION, ScanReport};
+pub use sqlite::{AiProfile, Db, ScanReport, PURPOSE_GLOSSARY, PURPOSE_TRANSLATION};

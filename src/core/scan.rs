@@ -71,7 +71,11 @@ mod tests {
         let r2 = scan_project(&db, &project, engine).unwrap();
         assert_eq!(r2.unchanged, 1);
         assert_eq!(
-            db.source_by_id(&id).unwrap().unwrap().translated_text.as_deref(),
+            db.source_by_id(&id)
+                .unwrap()
+                .unwrap()
+                .translated_text
+                .as_deref(),
             Some("สวัสดี")
         );
 

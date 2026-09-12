@@ -53,10 +53,15 @@ impl RpaIndex {
         let header = String::from_utf8_lossy(&header).to_string();
         let parts: Vec<&str> = header.split_whitespace().collect();
         if parts.first() != Some(&"RPA-3.0") {
-            bail!("{}: unsupported archive format (only RPA-3.0)", path.display());
+            bail!(
+                "{}: unsupported archive format (only RPA-3.0)",
+                path.display()
+            );
         }
         let index_offset = u64::from_str_radix(
-            parts.get(1).ok_or_else(|| anyhow!("missing index offset"))?,
+            parts
+                .get(1)
+                .ok_or_else(|| anyhow!("missing index offset"))?,
             16,
         )?;
         let key = parts
@@ -78,19 +83,20 @@ impl RpaIndex {
         let mut members = BTreeMap::new();
         for (name, records) in dict {
             let Some(name) = as_str(&name) else { continue };
-            let Some(records) = as_list(&records) else { continue };
+            let Some(records) = as_list(&records) else {
+                continue;
+            };
             for record in records {
-                let Some(record) = as_list(&record) else { continue };
+                let Some(record) = as_list(&record) else {
+                    continue;
+                };
                 if record.len() < 2 {
                     continue;
                 }
                 let (Some(offset), Some(length)) = (as_int(&record[0]), as_int(&record[1])) else {
                     continue;
                 };
-                let prefix = record
-                    .get(2)
-                    .and_then(as_bytes)
-                    .unwrap_or_default();
+                let prefix = record.get(2).and_then(as_bytes).unwrap_or_default();
                 // RPA-3.0 stores offsets and lengths XORed with the key.
                 let offset = (offset as u64) ^ key;
                 let length = (length as u64) ^ key;
@@ -202,7 +208,12 @@ pub enum Pickle {
 /// Parse the pickle dialect Ren'Py archives use (protocol 1 with the
 /// `_codecs.encode` REDUCE trick for byte strings).
 pub fn pickle_from_bytes(data: &[u8]) -> Result<Pickle> {
-    let mut p = PickleParser { data, pos: 0, stack: Vec::new(), memo: Vec::new() };
+    let mut p = PickleParser {
+        data,
+        pos: 0,
+        stack: Vec::new(),
+        memo: Vec::new(),
+    };
     p.run()
 }
 
@@ -270,9 +281,10 @@ impl<'a> PickleParser<'a> {
                     let mark = self.last_mark_pos()?;
                     let items: Vec<Pickle> = self.stack.drain(mark + 1..).collect();
                     self.stack.truncate(mark);
-                    let pairs = items.chunks(2).filter(|c| c.len() == 2).map(|c| {
-                        (c[0].clone(), c[1].clone())
-                    });
+                    let pairs = items
+                        .chunks(2)
+                        .filter(|c| c.len() == 2)
+                        .map(|c| (c[0].clone(), c[1].clone()));
                     match self.stack.last_mut() {
                         Some(Pickle::Dict(entries)) => entries.extend(pairs),
                         _ => bail!("SETITEMS without dict"),
@@ -280,8 +292,14 @@ impl<'a> PickleParser<'a> {
                 }
                 b's' => {
                     // SETITEM (value, key, dict)
-                    let value = self.stack.pop().ok_or_else(|| anyhow!("pickle truncated"))?;
-                    let key = self.stack.pop().ok_or_else(|| anyhow!("pickle truncated"))?;
+                    let value = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| anyhow!("pickle truncated"))?;
+                    let key = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| anyhow!("pickle truncated"))?;
                     match self.stack.last_mut() {
                         Some(Pickle::Dict(entries)) => entries.push((key, value)),
                         _ => bail!("SETITEM without dict"),
@@ -289,7 +307,10 @@ impl<'a> PickleParser<'a> {
                 }
                 b'a' => {
                     // APPEND: push one item onto the list below it.
-                    let item = self.stack.pop().ok_or_else(|| anyhow!("pickle truncated"))?;
+                    let item = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| anyhow!("pickle truncated"))?;
                     match self.stack.last_mut() {
                         Some(Pickle::List(list)) => list.push(item),
                         _ => bail!("APPEND without list"),
@@ -312,7 +333,8 @@ impl<'a> PickleParser<'a> {
                 b'I' | b'i' => {
                     let line = self.read_line()?;
                     let text = String::from_utf8_lossy(&line);
-                    self.stack.push(Pickle::Int(text.trim().parse().context("bad INT")?));
+                    self.stack
+                        .push(Pickle::Int(text.trim().parse().context("bad INT")?));
                 }
                 b'X' => {
                     let len = u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize;
@@ -393,7 +415,8 @@ impl<'a> PickleParser<'a> {
                 }
                 b'V' => {
                     let line = self.read_line()?;
-                    self.stack.push(Pickle::Str(String::from_utf8_lossy(&line).into_owned()));
+                    self.stack
+                        .push(Pickle::Str(String::from_utf8_lossy(&line).into_owned()));
                 }
                 b'c' => {
                     // GLOBAL: "module\nname\n" — only _codecs.encode is expected.
@@ -407,15 +430,19 @@ impl<'a> PickleParser<'a> {
                 }
                 b'R' => {
                     // REDUCE: callable(args)
-                    let args = self.stack.pop().ok_or_else(|| anyhow!("pickle truncated"))?;
-                    let callable = self.stack.pop().ok_or_else(|| anyhow!("pickle truncated"))?;
+                    let args = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| anyhow!("pickle truncated"))?;
+                    let callable = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| anyhow!("pickle truncated"))?;
                     if callable == Pickle::Str("\u{0}codecs-encode".into()) {
                         // codecs.encode(s) — the single tuple element for
                         // pickled call syntax.
                         let arg = match args {
-                            Pickle::Tuple(mut items) if items.len() == 1 => {
-                                items.remove(0)
-                            }
+                            Pickle::Tuple(mut items) if items.len() == 1 => items.remove(0),
                             other => other,
                         };
                         let text =
@@ -440,7 +467,11 @@ impl<'a> PickleParser<'a> {
                             self.take(4)?;
                         }
                     }
-                    let top = self.stack.last().cloned().ok_or_else(|| anyhow!("pickle truncated"))?;
+                    let top = self
+                        .stack
+                        .last()
+                        .cloned()
+                        .ok_or_else(|| anyhow!("pickle truncated"))?;
                     self.memo.push(top);
                 }
                 b'g' | b'h' => {
@@ -639,8 +670,8 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::testutil::{build_test_archive, temp_archive};
+    use super::*;
 
     #[test]
     fn parses_index_and_extracts_members() {
@@ -656,7 +687,9 @@ mod tests {
         assert_eq!(index.members.len(), 2);
         assert!(index.members.contains_key("a.rpy"));
 
-        assert!(index.names_with_extension(".rpy").contains(&"a.rpy".to_string()));
+        assert!(index
+            .names_with_extension(".rpy")
+            .contains(&"a.rpy".to_string()));
         assert!(index.names_with_extension(".rpyc").is_empty());
 
         let hello = index.read_member(&path, "a.rpy").unwrap();

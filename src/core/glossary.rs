@@ -39,10 +39,7 @@ fn is_word_like(term: &str) -> bool {
 }
 
 /// The enabled glossary entries whose source term appears in `text`.
-pub fn matches_for_text<'a>(
-    entries: &'a [GlossaryEntry],
-    text: &str,
-) -> Vec<&'a GlossaryEntry> {
+pub fn matches_for_text<'a>(entries: &'a [GlossaryEntry], text: &str) -> Vec<&'a GlossaryEntry> {
     entries
         .iter()
         .filter(|e| e.enabled && term_matches(&e.source, text))

@@ -35,11 +35,11 @@ const STOPWORDS: &[&str] = &[
     "have", "not", "are", "yes", "yeah", "hey", "hello", "well", "what", "when", "where", "why",
     "who", "how", "why", "just", "like", "know", "think", "really", "right", "okay", "fine",
     "come", "came", "going", "went", "gone", "get", "got", "gotta", "want", "wanted", "tell",
-    "told", "said", "says", "look", "looked", "see", "saw", "seen", "make", "made", "take",
-    "took", "give", "gave", "good", "bad", "girl", "girls", "man", "men", "woman", "women",
-    "wait", "stop", "thank", "thanks", "sorry", "please", "even", "ever", "still", "again",
-    "always", "never", "maybe", "because", "while", "after", "before", "here", "now", "one",
-    "two", "let", "lets", "don", "didn", "isn", "won", "can", "could", "would", "should", "will",
+    "told", "said", "says", "look", "looked", "see", "saw", "seen", "make", "made", "take", "took",
+    "give", "gave", "good", "bad", "girl", "girls", "man", "men", "woman", "women", "wait", "stop",
+    "thank", "thanks", "sorry", "please", "even", "ever", "still", "again", "always", "never",
+    "maybe", "because", "while", "after", "before", "here", "now", "one", "two", "let", "lets",
+    "don", "didn", "isn", "won", "can", "could", "would", "should", "will",
 ];
 
 fn is_stopword(word: &str) -> bool {
@@ -204,7 +204,10 @@ mod tests {
         let candidates = mine_candidates(&texts(), 50);
         let terms: Vec<&str> = candidates.iter().map(|c| c.term.as_str()).collect();
         assert!(terms.contains(&"Miss Jones"), "{terms:?}");
-        assert!(terms.iter().any(|t| t.contains("Morrow Guild")), "{terms:?}");
+        assert!(
+            terms.iter().any(|t| t.contains("Morrow Guild")),
+            "{terms:?}"
+        );
     }
 
     #[test]
@@ -244,8 +247,14 @@ mod tests {
         }
 
         let candidates = vec![
-            Candidate { term: "Morrow Guild".into(), count: 5 },
-            Candidate { term: "Miss Jones".into(), count: 2 },
+            Candidate {
+                term: "Morrow Guild".into(),
+                count: 5,
+            },
+            Candidate {
+                term: "Miss Jones".into(),
+                count: 2,
+            },
         ];
         let proposals = propose_glossary(&Mock, "Thai", &candidates, 50).unwrap();
         assert_eq!(proposals.len(), 1);

@@ -112,10 +112,7 @@ impl OpenAiCompatibleProvider {
     fn chat_url(&self) -> String {
         match self.kind() {
             EndpointKind::Ollama => native_url(&self.config.endpoint, "chat"),
-            EndpointKind::OpenAiCompatible => openai_url(
-                &self.config.endpoint,
-                "chat/completions",
-            ),
+            EndpointKind::OpenAiCompatible => openai_url(&self.config.endpoint, "chat/completions"),
         }
     }
 
@@ -167,8 +164,8 @@ impl TranslationProvider for OpenAiCompatibleProvider {
         .and_then(|c| c.as_str())
         .ok_or_else(|| anyhow!("AI response has no message content"))?;
 
-        let parsed = parse_content(content)
-            .map_err(|e| anyhow!("AI returned an unusable payload: {e}"))?;
+        let parsed =
+            parse_content(content).map_err(|e| anyhow!("AI returned an unusable payload: {e}"))?;
         Ok(parsed)
     }
 
@@ -208,9 +205,16 @@ impl TranslationProvider for OpenAiCompatibleProvider {
             .filter(|id| {
                 // Drop obvious non-chat models from the dropdown.
                 let l = id.to_lowercase();
-                !["embed", "whisper", "tts", "dall-e", "moderation", "transcribe"]
-                    .iter()
-                    .any(|bad| l.contains(bad))
+                ![
+                    "embed",
+                    "whisper",
+                    "tts",
+                    "dall-e",
+                    "moderation",
+                    "transcribe",
+                ]
+                .iter()
+                .any(|bad| l.contains(bad))
             })
             .collect();
         models.sort();
@@ -305,7 +309,9 @@ fn native_url(endpoint: &str, path: &str) -> String {
 fn strip_think(text: &str) -> String {
     let mut out = text.to_string();
     loop {
-        let Some(start) = out.to_lowercase().find("<think>") else { break };
+        let Some(start) = out.to_lowercase().find("<think>") else {
+            break;
+        };
         let after = &out[start..];
         match after.to_lowercase().find("</think>") {
             Some(end_rel) => {
@@ -451,23 +457,24 @@ mod tests {
         let parsed = parse_content(content).unwrap();
         assert_eq!(
             parsed.translations,
-            vec![TranslatedItem { id: "a".into(), text: "สวัสดี".into() }]
+            vec![TranslatedItem {
+                id: "a".into(),
+                text: "สวัสดี".into()
+            }]
         );
 
         // Unterminated block: nothing but thinking arrived.
         assert!(parse_content("<think>hmm").is_err());
 
         // Qwen3-style inline tag.
-        let parsed = parse_content(
-            "{\"translations\":[{\"id\":\"a\",\"text\":\"x\"}]}",
-        )
-        .unwrap();
+        let parsed = parse_content("{\"translations\":[{\"id\":\"a\",\"text\":\"x\"}]}").unwrap();
         assert_eq!(parsed.translations[0].text, "x");
     }
 
     #[test]
     fn parses_plain_json_payload() {
-        let content = r#"{"translations":[{"id":"a|1","text":"สวัสดี"},{"id":"a|2","text":"ลาก่อน"}]}"#;
+        let content =
+            r#"{"translations":[{"id":"a|1","text":"สวัสดี"},{"id":"a|2","text":"ลาก่อน"}]}"#;
         let parsed = parse_content(content).unwrap();
         assert_eq!(parsed.translations.len(), 2);
         assert_eq!(parsed.translations[0].id, "a|1");
@@ -476,9 +483,16 @@ mod tests {
 
     #[test]
     fn parses_fenced_json_with_prose() {
-        let content = "Here you go:\n```json\n{\"translations\":[{\"id\":\"x\",\"text\":\"y\"}]}\n```\nDone.";
+        let content =
+            "Here you go:\n```json\n{\"translations\":[{\"id\":\"x\",\"text\":\"y\"}]}\n```\nDone.";
         let parsed = parse_content(content).unwrap();
-        assert_eq!(parsed.translations, vec![TranslatedItem { id: "x".into(), text: "y".into() }]);
+        assert_eq!(
+            parsed.translations,
+            vec![TranslatedItem {
+                id: "x".into(),
+                text: "y".into()
+            }]
+        );
     }
 
     #[test]

@@ -310,6 +310,8 @@ export component AppWindow inherits Window {
     in-out property <string> set-concurrency;
     in-out property <string> set-context-before;
     in-out property <string> set-context-after;
+    in-out property <string> set-thai-dialogue-scale;
+    in-out property <string> set-thai-ui-scale;
     in-out property <string> set-prompt;
     in-out property <bool> set-export-to-none;
 
@@ -390,6 +392,8 @@ export component AppWindow inherits Window {
     callback save-concurrency(string);
     callback save-context-before(string);
     callback save-context-after(string);
+    callback save-thai-dialogue-scale(string);
+    callback save-thai-ui-scale(string);
     callback save-prompt(string);
     callback save-export-to-none(bool);
     callback close-editor();
@@ -1027,6 +1031,36 @@ export component AppWindow inherits Window {
                                             edited(text) => { root.save-context-after(text); }
                                         }
                                     }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        width: 180px;
+                                        FieldLabel { text: "Thai Dialogue Scale (%)"; }
+                                        LineEdit {
+                                            text <=> root.set-thai-dialogue-scale;
+                                            input-type: number;
+                                            edited(text) => { root.save-thai-dialogue-scale(text); }
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        width: 150px;
+                                        FieldLabel { text: "Thai UI Scale (%)"; }
+                                        LineEdit {
+                                            text <=> root.set-thai-ui-scale;
+                                            input-type: number;
+                                            edited(text) => { root.save-thai-ui-scale(text); }
+                                        }
+                                    }
+                                    Text {
+                                        text: "50–150; UI starts at 80%.";
+                                        vertical-alignment: center;
+                                        font-size: 11px;
+                                        color: #888;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
                                 }
                                 CheckBox {
                                     text: "Write translations to tl/None (for games without a language menu)";

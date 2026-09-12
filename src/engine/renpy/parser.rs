@@ -9,17 +9,65 @@
 /// with one of these (e.g. `return "x"`, `show image "bg"`) is never a say
 /// statement.
 const STATEMENT_KEYWORDS: &[&str] = &[
-    "if", "elif", "else", "while", "for", "return", "call", "jump", "scene", "show", "hide",
-    "play", "stop", "voice", "queue", "python", "default", "define", "menu", "label", "init",
-    "transform", "style", "image", "pause", "with", "window", "nvl", "screen", "translate",
-    "old", "new", "use", "add", "textbutton", "imagebutton", "hotspot", "vbox", "hbox", "frame",
-    "fixed", "grid", "side", "bar", "key", "timer", "mousearea", "drag", "draggroup", "config",
+    "if",
+    "elif",
+    "else",
+    "while",
+    "for",
+    "return",
+    "call",
+    "jump",
+    "scene",
+    "show",
+    "hide",
+    "play",
+    "stop",
+    "voice",
+    "queue",
+    "python",
+    "default",
+    "define",
+    "menu",
+    "label",
+    "init",
+    "transform",
+    "style",
+    "image",
+    "pause",
+    "with",
+    "window",
+    "nvl",
+    "screen",
+    "translate",
+    "old",
+    "new",
+    "use",
+    "add",
+    "textbutton",
+    "imagebutton",
+    "hotspot",
+    "vbox",
+    "hbox",
+    "frame",
+    "fixed",
+    "grid",
+    "side",
+    "bar",
+    "key",
+    "timer",
+    "mousearea",
+    "drag",
+    "draggroup",
+    "config",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineKind {
     /// `e "Hello."`, `e happy "Hello."`, `extend "..."` or narrator `"Hello."`
-    Say { speaker: Option<String>, text: String },
+    Say {
+        speaker: Option<String>,
+        text: String,
+    },
     /// `"Choice text":` or `"Choice text" if cond:` inside a `menu:` block
     Choice { text: String },
     /// `old "Hello"` in a translate block
@@ -28,6 +76,9 @@ pub enum LineKind {
     New { text: String },
     /// `label start:`
     Label { name: String },
+    /// A string used to create or update a quest, objective, or screen text.
+    /// `string_index` is the zero-based quoted-string position on its line.
+    ScriptText { text: String, string_index: usize },
     /// Anything the v1 parser does not translate (python, show, jump, ...)
     Other,
 }
@@ -60,12 +111,25 @@ pub fn parse(content: &str) -> Vec<ParsedLine> {
 
         let trimmed = raw.trim_start();
         let indent = raw.len() - trimmed.len();
-        let kind = classify(trimmed);
-        if kind != LineKind::Other {
-            out.push(ParsedLine { lineno, indent, kind });
+        for kind in classify_all(trimmed) {
+            if kind != LineKind::Other {
+                out.push(ParsedLine {
+                    lineno,
+                    indent,
+                    kind,
+                });
+            }
         }
     }
     out
+}
+
+fn classify_all(trimmed: &str) -> Vec<LineKind> {
+    let primary = classify(trimmed);
+    if primary != LineKind::Other {
+        return vec![primary];
+    }
+    quest_and_screen_texts(trimmed)
 }
 
 fn classify(trimmed: &str) -> LineKind {
@@ -170,6 +234,57 @@ fn classify_say_line(trimmed: &str) -> LineKind {
         speaker: Some(tokens[0].to_string()),
         text,
     }
+}
+
+/// Extract string literals from the Ren'Py/Python patterns used by quest
+/// journals, plus static `text "..."` screen labels. We intentionally avoid
+/// arbitrary Python strings so URLs, keys, and implementation details remain
+/// outside the translation queue.
+fn quest_and_screen_texts(line: &str) -> Vec<LineKind> {
+    let strings = strings_in_line(line);
+    if strings.is_empty() {
+        return Vec::new();
+    }
+
+    let indices: Vec<usize> = if line.contains("Quest(") || line.contains(".add_objective(") {
+        strings.iter().map(|(index, _)| *index).collect()
+    } else if line.contains(".objectives[") && line.contains("[\"text\"]") {
+        // The `"text"` dictionary key is not user-facing; the assignment
+        // value after it is.
+        strings.iter().skip(1).map(|(index, _)| *index).collect()
+    } else if line.trim_start().starts_with("text ") {
+        strings.iter().take(1).map(|(index, _)| *index).collect()
+    } else if line.trim_start().starts_with('$')
+        && line.contains("_texts")
+        && line.contains('[')
+    {
+        strings.iter().map(|(index, _)| *index).collect()
+    } else {
+        Vec::new()
+    };
+
+    indices
+        .into_iter()
+        .filter_map(|wanted| {
+            strings
+                .iter()
+                .find(|(index, _)| *index == wanted)
+                .map(|(_, text)| LineKind::ScriptText {
+                    text: text.clone(),
+                    string_index: wanted,
+                })
+        })
+        .collect()
+}
+
+fn strings_in_line(line: &str) -> Vec<(usize, String)> {
+    let mut strings = Vec::new();
+    let mut offset = 0usize;
+    while let Some((_start, end, text)) = scan_string(&line[offset..]) {
+        strings.push((strings.len(), text));
+        offset += end;
+    }
+    strings
 }
 
 /// Valid text after a dialogue string for it to be a say statement.
@@ -284,9 +399,17 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                LineKind::Label { name: "start".into() },
-                LineKind::Say { speaker: None, text: "Hello.".into() },
-                LineKind::Say { speaker: Some("e".into()), text: "Hi there!".into() },
+                LineKind::Label {
+                    name: "start".into()
+                },
+                LineKind::Say {
+                    speaker: None,
+                    text: "Hello.".into()
+                },
+                LineKind::Say {
+                    speaker: Some("e".into()),
+                    text: "Hi there!".into()
+                },
             ]
         );
     }
@@ -329,11 +452,17 @@ mod tests {
     fn say_with_nointeract_and_with_clause() {
         assert_eq!(
             kinds("e \"Go.\" nointeract\n"),
-            vec![LineKind::Say { speaker: Some("e".into()), text: "Go.".into() }]
+            vec![LineKind::Say {
+                speaker: Some("e".into()),
+                text: "Go.".into()
+            }]
         );
         assert_eq!(
             kinds("e \"Go.\" with dissolve\n"),
-            vec![LineKind::Say { speaker: Some("e".into()), text: "Go.".into() }]
+            vec![LineKind::Say {
+                speaker: Some("e".into()),
+                text: "Go.".into()
+            }]
         );
     }
 
@@ -343,8 +472,12 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                LineKind::Choice { text: "Go left".into() },
-                LineKind::Choice { text: "Go right".into() },
+                LineKind::Choice {
+                    text: "Go left".into()
+                },
+                LineKind::Choice {
+                    text: "Go right".into()
+                },
             ]
         );
     }
@@ -356,8 +489,12 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                LineKind::Old { text: "Hello".into() },
-                LineKind::New { text: "สวัสดี".into() },
+                LineKind::Old {
+                    text: "Hello".into()
+                },
+                LineKind::New {
+                    text: "สวัสดี".into()
+                },
             ]
         );
         // Indentation is preserved for the exporter.
@@ -384,13 +521,61 @@ mod tests {
     }
 
     #[test]
+    fn quest_objective_and_screen_texts_are_captured() {
+        let kinds = kinds(concat!(
+            "$ quest = Quest(\"Student Life\", \"Study and socialize.\")\n",
+            "$ quest.add_objective(\"Attend class.\", visible=True)\n",
+            "$ quest.objectives[0][\"text\"] = \"Attend math class.\"\n",
+            "$ _quest_texts = [\"One\", \"Two\"]\n",
+            "text \"Quest Log\":\n",
+        ));
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::ScriptText {
+                    text: "Student Life".into(),
+                    string_index: 0,
+                },
+                LineKind::ScriptText {
+                    text: "Study and socialize.".into(),
+                    string_index: 1,
+                },
+                LineKind::ScriptText {
+                    text: "Attend class.".into(),
+                    string_index: 0,
+                },
+                LineKind::ScriptText {
+                    text: "Attend math class.".into(),
+                    string_index: 1,
+                },
+                LineKind::ScriptText {
+                    text: "One".into(),
+                    string_index: 0,
+                },
+                LineKind::ScriptText {
+                    text: "Two".into(),
+                    string_index: 1,
+                },
+                LineKind::ScriptText {
+                    text: "Quest Log".into(),
+                    string_index: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn labels_are_captured() {
         let kinds = kinds("label start:\nlabel my_scene_2:\n");
         assert_eq!(
             kinds,
             vec![
-                LineKind::Label { name: "start".into() },
-                LineKind::Label { name: "my_scene_2".into() },
+                LineKind::Label {
+                    name: "start".into()
+                },
+                LineKind::Label {
+                    name: "my_scene_2".into()
+                },
             ]
         );
     }
@@ -400,7 +585,10 @@ mod tests {
         let src = "e \"\"\"multi\nline\"\"\"\ne \"after\"\n";
         assert_eq!(
             kinds(src),
-            vec![LineKind::Say { speaker: Some("e".into()), text: "after".into() }]
+            vec![LineKind::Say {
+                speaker: Some("e".into()),
+                text: "after".into()
+            }]
         );
     }
 
@@ -408,7 +596,10 @@ mod tests {
     fn narrator_say_requires_clean_suffix() {
         assert_eq!(
             kinds("\"Fine.\" # short answer\n"),
-            vec![LineKind::Say { speaker: None, text: "Fine.".into() }]
+            vec![LineKind::Say {
+                speaker: None,
+                text: "Fine.".into()
+            }]
         );
         // Dictionary-style line is not dialogue.
         assert!(kinds("\"key\": value,\n").is_empty());

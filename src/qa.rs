@@ -48,12 +48,8 @@ pub fn scan(db: &Db, project_id: &str, engine: &dyn GameEngine) -> Vec<QaIssue> 
         // Token / glossary violations (same rules the pipeline enforces).
         let tokens = engine.protected_tokens(&entry.source.source_text);
         let hits = glossary::matches_for_text(&glossary_entries, &entry.source.source_text);
-        let violations = pipeline::validate_item(
-            &entry.source.source_text,
-            translation,
-            &tokens,
-            &hits,
-        );
+        let violations =
+            pipeline::validate_item(&entry.source.source_text, translation, &tokens, &hits);
         if !violations.is_empty() {
             push(format!("translation problem: {}", violations.join("; ")));
         }
@@ -72,13 +68,15 @@ mod tests {
     use crate::core::engine::ExtractionResult;
     use crate::core::project::Project;
     use crate::core::source::SourceEntry;
+    use crate::core::translation::TranslationStatus;
     use crate::database::Db;
     use crate::engine::renpy::RENPY_ENGINE;
-    use crate::core::translation::TranslationStatus;
 
     fn db_with_entries() -> (Db, String) {
         let d = Db::open_in_memory().unwrap();
-        let p = d.project_upsert(&Project::new("T", "C:/t", "renpy")).unwrap();
+        let p = d
+            .project_upsert(&Project::new("T", "C:/t", "renpy"))
+            .unwrap();
         let sources: Vec<SourceEntry> = vec![
             SourceEntry {
                 id: "a.rpy|1".into(),
@@ -101,8 +99,14 @@ mod tests {
                 context: None,
             },
         ];
-        d.scan_apply(&p, &ExtractionResult { sources, existing_translations: vec![] })
-            .unwrap();
+        d.scan_apply(
+            &p,
+            &ExtractionResult {
+                sources,
+                existing_translations: vec![],
+            },
+        )
+        .unwrap();
         (d, p.id)
     }
 
@@ -124,7 +128,10 @@ mod tests {
 
         let issues = scan(&d, &pid, &RENPY_ENGINE);
         let labels: Vec<&str> = issues.iter().map(|i| i.label.as_str()).collect();
-        assert!(labels.iter().any(|l| l.contains("player_name")), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l.contains("player_name")),
+            "{labels:?}"
+        );
         assert!(labels.iter().any(|l| l.contains("identical")), "{labels:?}");
         // Ordered by file/line.
         assert!(issues.windows(2).all(|w| w[0].line <= w[1].line));
@@ -133,12 +140,8 @@ mod tests {
     #[test]
     fn failed_translations_are_reported() {
         let (d, pid) = db_with_entries();
-        d.set_translation(
-            &format!("{pid}|a.rpy|1"),
-            None,
-            TranslationStatus::Failed,
-        )
-        .unwrap();
+        d.set_translation(&format!("{pid}|a.rpy|1"), None, TranslationStatus::Failed)
+            .unwrap();
         let issues = scan(&d, &pid, &RENPY_ENGINE);
         assert_eq!(issues.len(), 1);
         assert!(issues[0].label.contains("failed"));

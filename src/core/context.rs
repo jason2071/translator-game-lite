@@ -8,7 +8,10 @@ pub struct ContextWindow {
 
 impl Default for ContextWindow {
     fn default() -> Self {
-        Self { before: 1, after: 1 }
+        Self {
+            before: 1,
+            after: 1,
+        }
     }
 }
 

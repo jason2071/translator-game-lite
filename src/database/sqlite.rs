@@ -74,11 +74,13 @@ impl Db {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         apply_pragmas(&conn)?;
         migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), path: path.to_path_buf() })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path: path.to_path_buf(),
+        })
     }
 
     /// Default per-user location: `<config>/translator-game-lite/data.db`.
@@ -94,7 +96,10 @@ impl Db {
         let conn = Connection::open_in_memory()?;
         apply_pragmas(&conn)?;
         migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), path: PathBuf::from(":memory:") })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path: PathBuf::from(":memory:"),
+        })
     }
 
     // ------------------------------------------------------------- projects
@@ -148,7 +153,11 @@ impl Db {
     /// Incremental scan apply (spec §20/§21): match extracted sources against
     /// the DB by stable id, reuse translations for unchanged hashes, reset
     /// changed ones to Pending, prefill new ones from translation memory.
-    pub fn scan_apply(&self, project: &Project, extraction: &ExtractionResult) -> Result<ScanReport> {
+    pub fn scan_apply(
+        &self,
+        project: &Project,
+        extraction: &ExtractionResult,
+    ) -> Result<ScanReport> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let pid = &project.id;
@@ -157,14 +166,18 @@ impl Db {
 
         let mut existing_hash: HashMap<String, String> = HashMap::new();
         {
-            let mut stmt = tx.prepare("SELECT id, source_hash FROM sources WHERE project_id = ?1")?;
+            let mut stmt =
+                tx.prepare("SELECT id, source_hash FROM sources WHERE project_id = ?1")?;
             let mut rows = stmt.query(params![pid])?;
             while let Some(row) = rows.next()? {
                 existing_hash.insert(row.get::<_, String>(0)?, row.get::<_, String>(1)?);
             }
         }
 
-        let mut report = ScanReport { total: extraction.sources.len(), ..Default::default() };
+        let mut report = ScanReport {
+            total: extraction.sources.len(),
+            ..Default::default()
+        };
         let mut seen: HashSet<String> = HashSet::with_capacity(extraction.sources.len());
 
         {
@@ -193,15 +206,29 @@ impl Db {
                         // Unchanged text: keep location/speaker/context fresh,
                         // keep the existing translation untouched.
                         upsert_source.execute(params![
-                            id, pid, source.engine_id, source.file_path, source.line,
-                            source.speaker, source.source_text, source.source_hash, source.context,
+                            id,
+                            pid,
+                            source.engine_id,
+                            source.file_path,
+                            source.line,
+                            source.speaker,
+                            source.source_text,
+                            source.source_hash,
+                            source.context,
                         ])?;
                         report.unchanged += 1;
                     }
                     _ => {
                         upsert_source.execute(params![
-                            id, pid, source.engine_id, source.file_path, source.line,
-                            source.speaker, source.source_text, source.source_hash, source.context,
+                            id,
+                            pid,
+                            source.engine_id,
+                            source.file_path,
+                            source.line,
+                            source.speaker,
+                            source.source_text,
+                            source.source_hash,
+                            source.context,
                         ])?;
                         // Changed or brand-new: reset, then try translation memory.
                         let remembered: Option<String> = tm_stmt
@@ -430,7 +457,10 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(ids.iter()), row_to_translation_entry)?
+            .query_map(
+                rusqlite::params_from_iter(ids.iter()),
+                row_to_translation_entry,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -567,7 +597,12 @@ impl Db {
              ON CONFLICT(source_id) DO UPDATE SET
                 translated_text=excluded.translated_text, status=excluded.status,
                 updated_at=excluded.updated_at",
-            params![source_id, text, status.as_str(), crate::core::project::now_unix()],
+            params![
+                source_id,
+                text,
+                status.as_str(),
+                crate::core::project::now_unix()
+            ],
         )?;
         Ok(())
     }
@@ -588,7 +623,9 @@ impl Db {
              ORDER BY line DESC LIMIT ?4",
         )?;
         let mut previous: Vec<String> = prev_stmt
-            .query_map(params![project_id, file_path, line, before as i64], |r| r.get(0))?
+            .query_map(params![project_id, file_path, line, before as i64], |r| {
+                r.get(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         previous.reverse();
 
@@ -598,7 +635,9 @@ impl Db {
              ORDER BY line ASC LIMIT ?4",
         )?;
         let next: Vec<String> = next_stmt
-            .query_map(params![project_id, file_path, line, after as i64], |r| r.get(0))?
+            .query_map(params![project_id, file_path, line, after as i64], |r| {
+                r.get(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok((previous, next))
@@ -625,7 +664,14 @@ impl Db {
         conn.execute(
             "INSERT INTO glossary (id, project_id, source_term, target_term, note, enabled)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![entry.id, entry.project_id, entry.source, entry.target, entry.note, entry.enabled],
+            params![
+                entry.id,
+                entry.project_id,
+                entry.source,
+                entry.target,
+                entry.note,
+                entry.enabled
+            ],
         )?;
         Ok(entry)
     }
@@ -766,10 +812,7 @@ impl Db {
 
     pub fn glossary_proposals_delete(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM glossary_proposals WHERE id = ?1",
-            params![id],
-        )?;
+        conn.execute("DELETE FROM glossary_proposals WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -818,7 +861,8 @@ impl Db {
 
     // -------------------------------------------------------------- settings
 
-    pub fn setting_get(&self, key: &str) -> Result<Option<String>> {        let conn = self.conn.lock().unwrap();
+    pub fn setting_get(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT value FROM settings WHERE key = ?1",
             params![key],
@@ -839,7 +883,9 @@ impl Db {
     }
 
     pub fn setting_get_or(&self, key: &str, default: &str) -> Result<String> {
-        Ok(self.setting_get(key)?.unwrap_or_else(|| default.to_string()))
+        Ok(self
+            .setting_get(key)?
+            .unwrap_or_else(|| default.to_string()))
     }
 
     // ----------------------------------------------------------- ai profiles
@@ -946,9 +992,14 @@ impl Db {
         let first = self.ai_profile_list()?.first().map(|p| p.id.clone());
         if let Some(first) = first {
             if self.setting_get(PURPOSE_TRANSLATION)?.is_none() {
-                let legacy =
-                    self.setting_get("active_profile_translation")?.unwrap_or_default();
-                let id = if legacy.is_empty() { first.clone() } else { legacy };
+                let legacy = self
+                    .setting_get("active_profile_translation")?
+                    .unwrap_or_default();
+                let id = if legacy.is_empty() {
+                    first.clone()
+                } else {
+                    legacy
+                };
                 self.setting_set(PURPOSE_TRANSLATION, &id)?;
             }
             if self.setting_get(PURPOSE_GLOSSARY)?.is_none() {
@@ -1167,7 +1218,9 @@ mod tests {
         let d = db();
         let p = project();
         let inserted = d.project_upsert(&p).unwrap();
-        let again = d.project_upsert(&Project::new("Other Name", &p.path, "renpy")).unwrap();
+        let again = d
+            .project_upsert(&Project::new("Other Name", &p.path, "renpy"))
+            .unwrap();
         assert_eq!(inserted.id, again.id);
         assert_eq!(again.name, "Test Game");
     }
@@ -1179,12 +1232,22 @@ mod tests {
 
         // Initial scan: 3 entries.
         let v1 = ExtractionResult {
-            sources: vec![source("script.rpy|1", "Hello", 1), source("script.rpy|2", "Bye", 2), source("script.rpy|5", "Fine.", 5)],
+            sources: vec![
+                source("script.rpy|1", "Hello", 1),
+                source("script.rpy|2", "Bye", 2),
+                source("script.rpy|5", "Fine.", 5),
+            ],
             existing_translations: vec![],
         };
         let report = d.scan_apply(&p, &v1).unwrap();
         assert_eq!(
-            (report.total, report.added, report.unchanged, report.changed, report.removed),
+            (
+                report.total,
+                report.added,
+                report.unchanged,
+                report.changed,
+                report.removed
+            ),
             (3, 3, 0, 0, 0)
         );
         let stats = d.stats(&p.id).unwrap();
@@ -1192,11 +1255,20 @@ mod tests {
 
         // Second identical scan: everything unchanged, translations kept.
         let report = d.scan_apply(&p, &v1).unwrap();
-        assert_eq!((report.added, report.unchanged, report.changed, report.removed), (0, 3, 0, 0));
+        assert_eq!(
+            (
+                report.added,
+                report.unchanged,
+                report.changed,
+                report.removed
+            ),
+            (0, 3, 0, 0)
+        );
 
         // Manual edit survives a rescan of the same content.
         let id1 = format!("{}|script.rpy|1", p.id);
-        d.set_translation(&id1, Some("สวัสดี"), TranslationStatus::Edited).unwrap();
+        d.set_translation(&id1, Some("สวัสดี"), TranslationStatus::Edited)
+            .unwrap();
         d.scan_apply(&p, &v1).unwrap();
         let entry = d.source_by_id(&id1).unwrap().unwrap();
         assert_eq!(entry.status, TranslationStatus::Edited);
@@ -1204,7 +1276,11 @@ mod tests {
 
         // Text changes at the same location: reset to Pending.
         let v2 = ExtractionResult {
-            sources: vec![source("script.rpy|1", "Hello there", 1), source("script.rpy|2", "Bye", 2), source("script.rpy|5", "Fine.", 5)],
+            sources: vec![
+                source("script.rpy|1", "Hello there", 1),
+                source("script.rpy|2", "Bye", 2),
+                source("script.rpy|5", "Fine.", 5),
+            ],
             existing_translations: vec![],
         };
         let report = d.scan_apply(&p, &v2).unwrap();
@@ -1239,7 +1315,10 @@ mod tests {
         .unwrap();
 
         let v1 = ExtractionResult {
-            sources: vec![source("tl/x.rpy|3", "Hello", 3), source("tl/x.rpy|4", "Good night", 4)],
+            sources: vec![
+                source("tl/x.rpy|3", "Hello", 3),
+                source("tl/x.rpy|4", "Good night", 4),
+            ],
             existing_translations: vec![crate::core::engine::ExistingTranslation {
                 source_id: "tl/x.rpy|4".into(),
                 text: "ราตรีสวัสดิ์".into(),
@@ -1268,10 +1347,22 @@ mod tests {
         let d = db();
         let p = d.project_upsert(&project()).unwrap();
         let sources: Vec<SourceEntry> = (0..10)
-            .map(|i| source(&format!("script.rpy|{}", i + 1), &format!("Line {}", i), i + 1))
+            .map(|i| {
+                source(
+                    &format!("script.rpy|{}", i + 1),
+                    &format!("Line {}", i),
+                    i + 1,
+                )
+            })
             .collect();
-        d.scan_apply(&p, &ExtractionResult { sources, existing_translations: vec![] })
-            .unwrap();
+        d.scan_apply(
+            &p,
+            &ExtractionResult {
+                sources,
+                existing_translations: vec![],
+            },
+        )
+        .unwrap();
 
         let page0 = d.sources_page(&p.id, None, 0, 4).unwrap();
         let page2 = d.sources_page(&p.id, None, 8, 4).unwrap();
@@ -1307,9 +1398,7 @@ mod tests {
         // Bulk re-translate reset: every translations row (scan_apply
         // pre-creates one per entry) goes back to pending and the old
         // text is cleared.
-        let reset = d
-            .translations_reset_pending(&p.id, None)
-            .unwrap();
+        let reset = d.translations_reset_pending(&p.id, None).unwrap();
         assert_eq!(reset, 10);
         assert_eq!(d.pending_entries(&p.id).unwrap().len(), 10);
         assert!(d
@@ -1344,10 +1433,22 @@ mod tests {
         let d = db();
         let p = d.project_upsert(&project()).unwrap();
         let sources: Vec<SourceEntry> = (0..3)
-            .map(|i| source(&format!("script.rpy|{}", i + 1), &format!("Line {}", i), i + 1))
+            .map(|i| {
+                source(
+                    &format!("script.rpy|{}", i + 1),
+                    &format!("Line {}", i),
+                    i + 1,
+                )
+            })
             .collect();
-        d.scan_apply(&p, &ExtractionResult { sources, existing_translations: vec![] })
-            .unwrap();
+        d.scan_apply(
+            &p,
+            &ExtractionResult {
+                sources,
+                existing_translations: vec![],
+            },
+        )
+        .unwrap();
         for i in 1..=3 {
             d.set_translation(
                 &format!("{}|script.rpy|{i}", p.id),
@@ -1370,7 +1471,14 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        assert_eq!(texts, vec!["แทน 1".to_string(), "คำแปล 2".to_string(), "แทน 3".to_string()]);
+        assert_eq!(
+            texts,
+            vec![
+                "แทน 1".to_string(),
+                "คำแปล 2".to_string(),
+                "แทน 3".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1383,8 +1491,14 @@ mod tests {
             source("script.rpy|3", "Jonesy waves", 3),
             source("script.rpy|4", "hello there", 4),
         ];
-        d.scan_apply(&p, &ExtractionResult { sources, existing_translations: vec![] })
-            .unwrap();
+        d.scan_apply(
+            &p,
+            &ExtractionResult {
+                sources,
+                existing_translations: vec![],
+            },
+        )
+        .unwrap();
         // Row 4 matches only via its translation column.
         d.set_translation(
             &format!("{}|script.rpy|4", p.id),
@@ -1394,20 +1508,28 @@ mod tests {
         .unwrap();
 
         // Substring, case-insensitive: rows 1, 2, 3 (source) and 4 (translation).
-        let ids = d.search_entry_ids(&p.id, "jones", false, false, None).unwrap();
+        let ids = d
+            .search_entry_ids(&p.id, "jones", false, false, None)
+            .unwrap();
         assert_eq!(ids.len(), 4);
 
         // Match case: row 2 (all lowercase) drops out.
-        let ids = d.search_entry_ids(&p.id, "Jones", true, false, None).unwrap();
+        let ids = d
+            .search_entry_ids(&p.id, "Jones", true, false, None)
+            .unwrap();
         assert_eq!(ids.len(), 3);
 
         // Whole word: "Jonesy" (row 3) drops out, boundaries still match.
-        let ids = d.search_entry_ids(&p.id, "jones", false, true, None).unwrap();
+        let ids = d
+            .search_entry_ids(&p.id, "jones", false, true, None)
+            .unwrap();
         assert_eq!(ids.len(), 3);
         assert!(ids.iter().all(|id| !id.ends_with("|3")));
 
         // Whole word + match case: only exact "Jones" tokens remain.
-        let ids = d.search_entry_ids(&p.id, "Jones", true, true, None).unwrap();
+        let ids = d
+            .search_entry_ids(&p.id, "Jones", true, true, None)
+            .unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().any(|id| id.ends_with("|1")));
         assert!(ids.iter().any(|id| id.ends_with("|4")));
@@ -1426,7 +1548,9 @@ mod tests {
         assert_eq!(d.sources_count(&p.id, Some("translated")).unwrap(), 1);
 
         // Entries can be fetched back in file/line order by id.
-        let whole = d.search_entry_ids(&p.id, "Jones", true, true, None).unwrap();
+        let whole = d
+            .search_entry_ids(&p.id, "Jones", true, true, None)
+            .unwrap();
         let rows = d.entries_by_ids(&whole).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].source.line, 1);
@@ -1440,8 +1564,14 @@ mod tests {
         let sources: Vec<SourceEntry> = (0..5)
             .map(|i| source(&format!("script.rpy|{}", i + 1), &format!("L{}", i), i + 1))
             .collect();
-        d.scan_apply(&p, &ExtractionResult { sources, existing_translations: vec![] })
-            .unwrap();
+        d.scan_apply(
+            &p,
+            &ExtractionResult {
+                sources,
+                existing_translations: vec![],
+            },
+        )
+        .unwrap();
 
         let (prev, next) = d.neighbors(&p.id, "script.rpy", 3, 2, 1).unwrap();
         assert_eq!(prev, vec!["L0", "L1"]);
@@ -1453,7 +1583,9 @@ mod tests {
         let d = db();
         let p = d.project_upsert(&project()).unwrap();
 
-        let alice = d.glossary_add(&p.id, "  Alice ", " อลิซ ", Some("Character")).unwrap();
+        let alice = d
+            .glossary_add(&p.id, "  Alice ", " อลิซ ", Some("Character"))
+            .unwrap();
         assert_eq!(alice.source, "Alice");
         assert_eq!(alice.target, "อลิซ");
         let guild = d.glossary_add(&p.id, "Guild", "กิลด์", None).unwrap();
@@ -1478,19 +1610,25 @@ mod tests {
     fn memory_roundtrip() {
         let d = db();
         assert_eq!(d.memory_get("h1", "Thai").unwrap(), None);
-        d.memory_put_many(&[("h1".into(), "Hello".into(), "สวัสดี".into())], "Thai").unwrap();
+        d.memory_put_many(&[("h1".into(), "Hello".into(), "สวัสดี".into())], "Thai")
+            .unwrap();
         assert_eq!(d.memory_get("h1", "Thai").unwrap().as_deref(), Some("สวัสดี"));
         // Different language does not hit.
         assert_eq!(d.memory_get("h1", "Japanese").unwrap(), None);
         // Upsert overwrites.
-        d.memory_put_many(&[("h1".into(), "Hello".into(), "ฮัลโหล".into())], "Thai").unwrap();
-        assert_eq!(d.memory_get("h1", "Thai").unwrap().as_deref(), Some("ฮัลโหล"));
+        d.memory_put_many(&[("h1".into(), "Hello".into(), "ฮัลโหล".into())], "Thai")
+            .unwrap();
+        assert_eq!(
+            d.memory_get("h1", "Thai").unwrap().as_deref(),
+            Some("ฮัลโหล")
+        );
     }
 
     #[test]
     fn ai_profiles_crud_and_default_migration() {
         let d = db();
-        d.setting_set("api_endpoint", "https://ollama.com/v1").unwrap();
+        d.setting_set("api_endpoint", "https://ollama.com/v1")
+            .unwrap();
         d.setting_set("api_key", "sk-x").unwrap();
         d.setting_set("model", "gemma4:31b").unwrap();
 
@@ -1560,7 +1698,9 @@ mod tests {
             "second"
         );
         assert_eq!(
-            d.ai_profile_for_purpose("translation_profile_id").unwrap().id,
+            d.ai_profile_for_purpose("translation_profile_id")
+                .unwrap()
+                .id,
             p.id
         );
 
@@ -1568,7 +1708,9 @@ mod tests {
         d.ai_profile_delete(&p.id).unwrap();
         assert!(d.ai_profile_get(&p.id).unwrap().is_none());
         assert_eq!(
-            d.ai_profile_for_purpose("translation_profile_id").unwrap().id,
+            d.ai_profile_for_purpose("translation_profile_id")
+                .unwrap()
+                .id,
             "second"
         );
     }
@@ -1577,7 +1719,10 @@ mod tests {
     fn settings_roundtrip() {
         let d = db();
         assert_eq!(d.setting_get("model").unwrap(), None);
-        assert_eq!(d.setting_get_or("model", "gpt-4o-mini").unwrap(), "gpt-4o-mini");
+        assert_eq!(
+            d.setting_get_or("model", "gpt-4o-mini").unwrap(),
+            "gpt-4o-mini"
+        );
         d.setting_set("model", "gpt-4.1-mini").unwrap();
         d.setting_set("model", "gpt-4o").unwrap();
         assert_eq!(d.setting_get("model").unwrap().as_deref(), Some("gpt-4o"));

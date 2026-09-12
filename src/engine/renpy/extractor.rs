@@ -29,8 +29,8 @@ pub fn extract(game_root: &Path) -> Result<ExtractionResult> {
     // Archive members are logical "files" with virtual paths.
     let mut archives: Vec<(PathBuf, RpaIndex, Vec<String>)> = Vec::new();
     for rpa_path in collect_rpa_files(game_root)? {
-        let index = RpaIndex::open(&rpa_path)
-            .with_context(|| format!("reading {}", rpa_path.display()))?;
+        let index =
+            RpaIndex::open(&rpa_path).with_context(|| format!("reading {}", rpa_path.display()))?;
         let mut scripts = index.names_with_extension(".rpy");
         scripts.sort();
         archives.push((rpa_path, index, scripts));
@@ -122,6 +122,20 @@ fn extract_content(
                     .sources
                     .push(entry(rel, parsed.lineno, None, text, scene.clone()));
             }
+            LineKind::ScriptText { text, string_index } => {
+                flush_old(&mut pending_old, result, rel);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                result.sources.push(script_entry(
+                    rel,
+                    parsed.lineno,
+                    None,
+                    text,
+                    scene.clone(),
+                    string_index,
+                ));
+            }
             LineKind::Old { text } => {
                 flush_old(&mut pending_old, result, rel);
                 pending_old = Some((parsed.lineno, text, scene.clone()));
@@ -166,6 +180,26 @@ fn entry(
 ) -> SourceEntry {
     SourceEntry {
         id: format!("{}|{}", rel_path, line),
+        engine_id: "renpy".to_string(),
+        file_path: rel_path.to_string(),
+        line,
+        speaker,
+        source_hash: hash_text(&text),
+        source_text: text,
+        context: scene,
+    }
+}
+
+fn script_entry(
+    rel_path: &str,
+    line: u32,
+    speaker: Option<String>,
+    text: String,
+    scene: Option<String>,
+    string_index: usize,
+) -> SourceEntry {
+    SourceEntry {
+        id: format!("{}|{}#{}", rel_path, line, string_index),
         engine_id: "renpy".to_string(),
         file_path: rel_path.to_string(),
         line,
@@ -309,7 +343,11 @@ mod tests {
 
         let result = extract(&game).expect("extract");
 
-        let texts: Vec<&str> = result.sources.iter().map(|s| s.source_text.as_str()).collect();
+        let texts: Vec<&str> = result
+            .sources
+            .iter()
+            .map(|s| s.source_text.as_str())
+            .collect();
         assert_eq!(
             texts,
             vec![
@@ -374,6 +412,53 @@ mod tests {
     }
 
     #[test]
+    fn extracts_quest_titles_descriptions_objectives_and_screen_text() {
+        let root = temp_root("quest");
+        let game = root.join("game");
+        write(
+            &root,
+            "game/quests.rpy",
+            concat!(
+                "label quests:\n",
+                "$ student_life = Quest(\"Student Life\", \"Study and socialize.\")\n",
+                "$ student_life.add_objective(\"Attend class.\", visible=True)\n",
+                "screen quest_log:\n",
+                "    text \"Quest Log\":\n",
+            ),
+        );
+
+        let result = extract(&game).unwrap();
+        let texts: Vec<&str> = result
+            .sources
+            .iter()
+            .map(|source| source.source_text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Student Life",
+                "Study and socialize.",
+                "Attend class.",
+                "Quest Log"
+            ]
+        );
+        let ids: Vec<&str> = result.sources.iter().map(|source| source.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "quests.rpy|2#0",
+                "quests.rpy|2#1",
+                "quests.rpy|3#0",
+                "quests.rpy|5#0"
+            ]
+        );
+        assert!(result
+            .sources
+            .iter()
+            .all(|source| source.context.as_deref() == Some("quests")));
+    }
+
+    #[test]
     fn extracts_from_rpa_archive_and_skips_skeleton_lines() {
         let root = temp_root("rpa");
         let game = root.join("game");
@@ -396,7 +481,11 @@ mod tests {
 
         let result = extract(&game).unwrap();
 
-        let texts: Vec<&str> = result.sources.iter().map(|s| s.source_text.as_str()).collect();
+        let texts: Vec<&str> = result
+            .sources
+            .iter()
+            .map(|s| s.source_text.as_str())
+            .collect();
         assert_eq!(texts, vec!["From archive", "From archive"]);
         // Archive entry: speaker resolved from the define inside the archive.
         assert_eq!(result.sources[0].file_path, "archive.rpa!script.rpy");
@@ -407,6 +496,46 @@ mod tests {
         assert!(result.existing_translations.is_empty());
     }
 
+    #[test]
+    fn extracts_quest_texts_from_rpa_archives() {
+        let root = temp_root("rpa-quest");
+        let game = root.join("game");
+        fs::create_dir_all(&game).unwrap();
+        let archive = game.join("archive.rpa");
+        crate::engine::renpy::rpa::testutil::build_test_archive(
+            &archive,
+            &[(
+                "quests.rpy",
+                concat!(
+                    "label quests:\n",
+                    "$ quest = Quest(\"Student Life\", \"Study and socialize.\")\n",
+                    "$ quest.add_objective(\"Attend class.\", visible=True)\n",
+                    "text \"Quest Log\":\n",
+                ),
+            )],
+        );
+
+        let result = extract(&game).unwrap();
+        let texts: Vec<&str> = result
+            .sources
+            .iter()
+            .map(|source| source.source_text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Student Life",
+                "Study and socialize.",
+                "Attend class.",
+                "Quest Log"
+            ]
+        );
+        assert!(result
+            .sources
+            .iter()
+            .all(|source| source.file_path == "archive.rpa!quests.rpy"));
+    }
+
     /// Probe against a real, archive-packed Ren'Py game when one is
     /// available on this machine. Run with:
     /// `cargo test real_game_probe -- --ignored --nocapture`
@@ -415,9 +544,7 @@ mod tests {
     fn real_game_probe() {
         use crate::core::engine::detect_engine;
 
-        let root = std::path::Path::new(
-            r"F:\Downloads\new\NothingWeirdHappensHere-v0.56-pc",
-        );
+        let root = std::path::Path::new(r"F:\Downloads\new\NothingWeirdHappensHere-v0.56-pc");
         if !root.exists() {
             eprintln!("probe game not present; skipping");
             return;
@@ -426,15 +553,22 @@ mod tests {
         assert_eq!(engine.id(), "renpy");
         let result = engine.extract(root).expect("extract");
         println!("sources: {}", result.sources.len());
-        println!("existing translations: {}", result.existing_translations.len());
+        println!(
+            "existing translations: {}",
+            result.existing_translations.len()
+        );
         for s in result.sources.iter().take(10) {
-            println!("  [{}:{}] {:?}: {:?}", s.file_path, s.line, s.speaker, s.source_text);
+            println!(
+                "  [{}:{}] {:?}: {:?}",
+                s.file_path, s.line, s.speaker, s.source_text
+            );
         }
         assert!(result.sources.len() > 100);
     }
 
     #[test]
-    fn engine_detect_and_extract_via_trait() {        use crate::core::engine::detect_engine;
+    fn engine_detect_and_extract_via_trait() {
+        use crate::core::engine::detect_engine;
         let root = temp_root("detect");
         write(&root, "game/script.rpy", "e \"Hi\"\n");
 

@@ -14,6 +14,15 @@ use crate::core::translation::TranslationEntry;
 
 use super::parser::{escape, keyword_is, keyword_string, scan_string};
 
+const THAI_FONT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/IBMPlexSansThai-Regular.ttf"
+));
+const THAI_FONT_OVERRIDE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/renpy/01_gtl_thai_font.rpy"
+));
+
 struct RawLine {
     /// Line content without its terminator.
     text: String,
@@ -26,22 +35,61 @@ fn split_preserving_endings(content: &str) -> Vec<RawLine> {
         .split_inclusive('\n')
         .map(|chunk| {
             if let Some(stripped) = chunk.strip_suffix("\r\n") {
-                RawLine { text: stripped.to_string(), eol: "\r\n" }
+                RawLine {
+                    text: stripped.to_string(),
+                    eol: "\r\n",
+                }
             } else if let Some(stripped) = chunk.strip_suffix('\n') {
-                RawLine { text: stripped.to_string(), eol: "\n" }
+                RawLine {
+                    text: stripped.to_string(),
+                    eol: "\n",
+                }
             } else {
-                RawLine { text: chunk.to_string(), eol: "" }
+                RawLine {
+                    text: chunk.to_string(),
+                    eol: "",
+                }
             }
         })
         .collect()
 }
 
-/// Replace the first string literal on `raw` (the span returned by
-/// `scan_string` includes both quotes), keeping everything else on the
-/// line intact. `None` when the line has no complete string.
-fn rewrite_string_span(raw: &str, new_text: &str) -> Option<String> {
-    let (start, end, _current) = scan_string(raw)?;
-    Some(format!("{}\"{}\"{}", &raw[..start], escape(new_text), &raw[end..]))
+/// Locate the requested double-quoted string on a line. The returned span
+/// includes both quotes.
+fn scan_string_at(raw: &str, string_index: usize) -> Option<(usize, usize, String)> {
+    let mut offset = 0usize;
+    for current_index in 0..=string_index {
+        let (start, end, text) = scan_string(&raw[offset..])?;
+        if current_index == string_index {
+            return Some((offset + start, offset + end, text));
+        }
+        offset += end;
+    }
+    None
+}
+
+/// Replace one string literal on `raw`, keeping everything else on the line
+/// intact. `None` when that string does not exist.
+fn rewrite_string_span(raw: &str, string_index: usize, new_text: &str) -> Option<String> {
+    let (start, end, _current) = scan_string_at(raw, string_index)?;
+    Some(format!(
+        "{}\"{}\"{}",
+        &raw[..start],
+        escape(new_text),
+        &raw[end..]
+    ))
+}
+
+/// Script-only strings can share one line (for example,
+/// `Quest("Title", "Description")`). Their local IDs end in `#<index>`;
+/// dialogue and menu entries retain their historic `path|line` IDs.
+fn string_index_from_source_id(source_id: &str) -> usize {
+    source_id
+        .rsplit('|')
+        .next()
+        .and_then(|part| part.split_once('#'))
+        .and_then(|(_, index)| index.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Apply translations to the game files under `game_root`.
@@ -52,11 +100,32 @@ fn rewrite_string_span(raw: &str, new_text: &str) -> Option<String> {
 /// `translate <language> strings:` old/new pairs into `tl/<language>/`, which
 /// Ren'Py applies at runtime (including to dialogue without its own
 /// translate block).
+#[cfg(test)]
 pub fn export(
     game_root: &Path,
     translations: &[TranslationEntry],
     target_language: &str,
     to_default_language: bool,
+) -> Result<ExportReport> {
+    export_with_thai_font_scales(
+        game_root,
+        translations,
+        target_language,
+        to_default_language,
+        100.0,
+        80.0,
+    )
+}
+
+/// Variant of [`export`] that lets callers independently choose the dialogue
+/// and UI scales of the bundled Thai font. Values are clamped to 50–150%.
+pub fn export_with_thai_font_scales(
+    game_root: &Path,
+    translations: &[TranslationEntry],
+    target_language: &str,
+    to_default_language: bool,
+    thai_dialogue_font_scale_percent: f32,
+    thai_ui_font_scale_percent: f32,
 ) -> Result<ExportReport> {
     let mut with_text: Vec<&TranslationEntry> = Vec::new();
     for t in translations {
@@ -65,15 +134,96 @@ pub fn export(
         }
         with_text.push(t);
     }
-    let (virtual_entries, real_entries): (Vec<_>, Vec<_>) =
-        with_text.into_iter().partition(|t| t.source.file_path.contains('!'));
+    let (virtual_entries, real_entries): (Vec<_>, Vec<_>) = with_text
+        .into_iter()
+        .partition(|t| t.source.file_path.contains('!'));
 
     let mut report = export_in_place(game_root, &real_entries)?;
-    let (files, written) =
-        export_virtual(game_root, &virtual_entries, target_language, to_default_language)?;
+    let (files, written) = export_virtual(
+        game_root,
+        &virtual_entries,
+        target_language,
+        to_default_language,
+    )?;
     report.files_written += files;
     report.entries_written += written;
+
+    if to_default_language {
+        // tl/None only covers screens/system strings. To translate dialogue
+        // in games without a language selector, also refresh the
+        // language-named strings file and force the language on startup.
+        let (f2, w2) = export_virtual(game_root, &virtual_entries, target_language, false)?;
+        report.files_written += f2;
+        report.entries_written += w2;
+
+        let lang = sanitize_dir_name(target_language);
+        let force = game_root
+            .join("tl")
+            .join("None")
+            .join("00_gtl_apply_language.rpy");
+        std::fs::write(
+            &force,
+            format!(
+                "# Written by Game Translator Lite: this game has no language\n\
+                 # selector, so the translation is applied automatically.\n\
+                 init 999 python:\n\
+                 \x20   persistent.language = \"{lang}\"\n\
+                 \x20   try:\n\
+                 \x20       renpy.change_language(\"{lang}\")\n\
+                 \x20   except Exception:\n\
+                 \x20       pass\n"
+            ),
+        )?;
+    } else {
+        // Leaving None mode: remove the language-forcing file.
+        let _ = std::fs::remove_file(
+            game_root
+                .join("tl")
+                .join("None")
+                .join("00_gtl_apply_language.rpy"),
+        );
+    }
+
+    if target_language.eq_ignore_ascii_case("thai") {
+        install_thai_font(
+            game_root,
+            thai_dialogue_font_scale_percent,
+            thai_ui_font_scale_percent,
+        )?;
+    }
     Ok(report)
+}
+
+/// Install a bundled Thai-capable font and apply it after the game's own GUI
+/// styles have initialized. Archive-packed games often bundle a Latin-only
+/// font, which otherwise renders Thai translations as square glyphs.
+fn install_thai_font(
+    game_root: &Path,
+    thai_dialogue_font_scale_percent: f32,
+    thai_ui_font_scale_percent: f32,
+) -> Result<usize> {
+    let dir = game_root.join("tl").join("None");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("gtl_thai_font.ttf"), THAI_FONT)?;
+    let scale = |percent: f32, default: f32| {
+        if percent.is_finite() {
+            percent.clamp(50.0, 150.0) / 100.0
+        } else {
+            default
+        }
+    };
+    let dialogue_scale = scale(thai_dialogue_font_scale_percent, 1.0);
+    let ui_scale = scale(thai_ui_font_scale_percent, 0.8);
+    std::fs::write(
+        dir.join("01_gtl_thai_font.rpy"),
+        THAI_FONT_OVERRIDE
+            .replace(
+                "__GTL_DIALOGUE_FONT_SCALE__",
+                &format!("{dialogue_scale:.2}"),
+            )
+            .replace("__GTL_UI_FONT_SCALE__", &format!("{ui_scale:.2}")),
+    )?;
+    Ok(2)
 }
 
 /// Write archive-sourced translations into `tl/<language>/<archive>_gtl.rpy`
@@ -205,10 +355,12 @@ fn export_virtual(
 fn sanitize_dir_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-            '_'
-        } else {
-            c
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
         })
         .collect();
     if cleaned.trim().is_empty() {
@@ -247,7 +399,10 @@ fn parse_old_new_pairs(content: &str) -> Vec<(String, Option<String>)> {
 fn export_in_place(game_root: &Path, translations: &[&TranslationEntry]) -> Result<ExportReport> {
     let mut by_file: HashMap<&str, Vec<&TranslationEntry>> = HashMap::new();
     for t in translations {
-        by_file.entry(t.source.file_path.as_str()).or_default().push(t);
+        by_file
+            .entry(t.source.file_path.as_str())
+            .or_default()
+            .push(t);
     }
     // Sort keys for deterministic file processing.
     let mut files: Vec<(&str, Vec<&TranslationEntry>)> = by_file.into_iter().collect();
@@ -288,7 +443,7 @@ fn export_in_place(game_root: &Path, translations: &[&TranslationEntry]) -> Resu
                 for j in idx + 1..=last {
                     let next_trimmed = lines[j].text.trim_start();
                     if keyword_string(next_trimmed, "new").is_some() {
-                        if let Some(new_raw) = rewrite_string_span(&lines[j].text, translated) {
+                        if let Some(new_raw) = rewrite_string_span(&lines[j].text, 0, translated) {
                             lines[j].text = new_raw;
                             applied = true;
                         }
@@ -298,12 +453,14 @@ fn export_in_place(game_root: &Path, translations: &[&TranslationEntry]) -> Resu
                 if !applied {
                     // No `new` line exists yet — insert one after the `old`.
                     let indent_len = raw.len() - trimmed.len();
-                    let inserted = format!(
-                        "{}new \"{}\"",
-                        &raw[..indent_len],
-                        escape(translated)
+                    let inserted = format!("{}new \"{}\"", &raw[..indent_len], escape(translated));
+                    lines.insert(
+                        idx + 1,
+                        RawLine {
+                            text: inserted,
+                            eol: lines[idx].eol,
+                        },
                     );
-                    lines.insert(idx + 1, RawLine { text: inserted, eol: lines[idx].eol });
                 }
                 report.entries_written += 1;
                 modified = true;
@@ -318,14 +475,15 @@ fn export_in_place(game_root: &Path, translations: &[&TranslationEntry]) -> Resu
 
             // say / menu choice: replace the string in place, but only if
             // the file still matches what was scanned.
-            let matches_original = scan_string(trimmed)
+            let string_index = string_index_from_source_id(&t.source.id);
+            let matches_original = scan_string_at(trimmed, string_index)
                 .map(|(_s, _e, current)| current == original)
                 .unwrap_or(false);
             if !matches_original {
                 report.entries_skipped += 1;
                 continue;
             }
-            if let Some(new_raw) = rewrite_string_span(&raw, translated) {
+            if let Some(new_raw) = rewrite_string_span(&raw, string_index, translated) {
                 lines[idx].text = new_raw;
                 report.entries_written += 1;
                 modified = true;
@@ -389,6 +547,18 @@ mod tests {
         }
     }
 
+    fn script_entry(
+        rel: &str,
+        line: u32,
+        string_index: usize,
+        original: &str,
+        translated: &str,
+    ) -> TranslationEntry {
+        let mut entry = entry(rel, line, original, translated);
+        entry.source.id = format!("{rel}|{line}#{string_index}");
+        entry
+    }
+
     #[test]
     fn rewrites_say_lines_in_place() {
         let root = temp_root("say");
@@ -402,7 +572,12 @@ mod tests {
         let report = export(
             &root,
             &[
-                entry("script.rpy", 3, "Hello [player_name]!", "สวัสดี [player_name]!"),
+                entry(
+                    "script.rpy",
+                    3,
+                    "Hello [player_name]!",
+                    "สวัสดี [player_name]!",
+                ),
                 entry("script.rpy", 4, "Fine.", "โอเค"),
             ],
             "Thai",
@@ -419,6 +594,40 @@ mod tests {
             out,
             "define e = Character(\"Eileen\")\nlabel start:\n    e \"สวัสดี [player_name]!\"\n    \"โอเค\"\n"
         );
+    }
+
+    #[test]
+    fn rewrites_quest_and_screen_strings_at_their_exact_positions() {
+        let root = temp_root("quest");
+        let file = root.join("quests.rpy");
+        fs::write(
+            &file,
+            concat!(
+                "$ student_life = Quest(\"Student Life\", \"Study and socialize.\")\n",
+                "$ student_life.add_objective(\"Attend class.\", visible=True)\n",
+                "text \"Quest Log\":\n",
+            ),
+        )
+        .unwrap();
+
+        let report = export(
+            &root,
+            &[
+                script_entry("quests.rpy", 1, 0, "Student Life", "ชีวิตนักศึกษา"),
+                script_entry("quests.rpy", 1, 1, "Study and socialize.", "เรียนและเข้าสังคม"),
+                script_entry("quests.rpy", 2, 0, "Attend class.", "เข้าเรียน"),
+                script_entry("quests.rpy", 3, 0, "Quest Log", "บันทึกภารกิจ"),
+            ],
+            "Thai",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.entries_written, 4);
+        let out = fs::read_to_string(file).unwrap();
+        assert!(out.contains("Quest(\"ชีวิตนักศึกษา\", \"เรียนและเข้าสังคม\")"));
+        assert!(out.contains("add_objective(\"เข้าเรียน\", visible=True)"));
+        assert!(out.contains("text \"บันทึกภารกิจ\":"));
     }
 
     #[test]
@@ -457,7 +666,13 @@ mod tests {
         let file = root.join("script.rpy");
         fs::write(&file, "e \"Hello\"\n").unwrap();
 
-        let report = export(&root, &[entry("script.rpy", 1, "Outdated", "เดิม")], "Thai", false).unwrap();
+        let report = export(
+            &root,
+            &[entry("script.rpy", 1, "Outdated", "เดิม")],
+            "Thai",
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.entries_skipped, 1);
         assert_eq!(report.entries_written, 0);
@@ -503,8 +718,7 @@ mod tests {
     #[test]
     fn missing_file_counts_as_skipped() {
         let root = temp_root("missing");
-        let report =
-            export(&root, &[entry("gone.rpy", 1, "A", "เอ")], "Thai", false).unwrap();
+        let report = export(&root, &[entry("gone.rpy", 1, "A", "เอ")], "Thai", false).unwrap();
         assert_eq!(report.entries_skipped, 1);
         assert_eq!(report.files_written, 0);
     }
@@ -538,7 +752,10 @@ mod tests {
             out,
             "translate thai strings:\n\n    old \"Hello [name]\"\n    new \"สวัสดี [name]\"\n\n    old \"Hi there.\"\n    new \"ไง\"\n"
         );
-        assert_eq!(fs::read_to_string(root.join("script.rpy")).unwrap(), "e \"หลวม\"\n");
+        assert_eq!(
+            fs::read_to_string(root.join("script.rpy")).unwrap(),
+            "e \"หลวม\"\n"
+        );
     }
 
     #[test]
@@ -585,15 +802,48 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.files_written, 1);
-        let path = root.join("tl/None/archive_gtl.rpy");
-        let out = fs::read_to_string(&path).unwrap();
+        assert_eq!(report.files_written, 2);
+        let none_path = root.join("tl/None/archive_gtl.rpy");
+        let out = fs::read_to_string(&none_path).unwrap();
         assert_eq!(
             out,
             "translate None strings:\n\n    old \"Brand new\"\n    new \"ใหม่\"\n\n    old \"Hello\"\n    new \"สวัสดี\"\n"
         );
-        // The language-named folder must not be created in this mode.
-        assert!(!root.join("tl/Thai").exists());
+        let thai_path = root.join("tl/Thai/archive_gtl.rpy");
+        assert!(thai_path.exists());
+        let force = fs::read_to_string(root.join("tl/None/00_gtl_apply_language.rpy")).unwrap();
+        assert!(force.contains("renpy.change_language(\"Thai\")"), "{force}");
+        assert_eq!(
+            fs::read(root.join("tl/None/gtl_thai_font.ttf")).unwrap(),
+            THAI_FONT
+        );
+        let font_script = fs::read_to_string(root.join("tl/None/01_gtl_thai_font.rpy")).unwrap();
+        assert!(font_script.contains("config.font_replacement_map"));
+        assert!(font_script.contains("1.00"), "{font_script}");
+        assert!(font_script.contains("0.80"), "{font_script}");
+    }
+
+    #[test]
+    fn thai_font_scales_are_written_and_clamped() {
+        let root = temp_root("rp.font-scale");
+        export_with_thai_font_scales(
+            &root,
+            &[entry("archive.rpa!s.rpy", 1, "Hello", "สวัสดี")],
+            "Thai",
+            false,
+            200.0,
+            10.0,
+        )
+        .unwrap();
+
+        let script = fs::read_to_string(root.join("tl/None/01_gtl_thai_font.rpy")).unwrap();
+        assert!(script.contains("1.50"), "{script}");
+        assert!(script.contains("0.50"), "{script}");
+        assert!(
+            !script.contains("__GTL_DIALOGUE_FONT_SCALE__"),
+            "{script}"
+        );
+        assert!(!script.contains("__GTL_UI_FONT_SCALE__"), "{script}");
     }
 
     #[test]

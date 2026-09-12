@@ -62,7 +62,10 @@ fn current_project(db: &Db) -> Option<Project> {
 }
 
 fn engine_for(project: &Project) -> Option<&'static dyn GameEngine> {
-    registry().iter().copied().find(|e| e.id() == project.engine_id)
+    registry()
+        .iter()
+        .copied()
+        .find(|e| e.id() == project.engine_id)
 }
 
 fn apply_project(ui: &AppWindow, project: &Project) {
@@ -79,8 +82,7 @@ fn refresh_stats(ui: &AppWindow, db: &Db, project: &Project) -> Result<()> {
     ui.set_stat_pending(stats.pending as i32);
     ui.set_stat_failed(stats.failed as i32);
     let page = PAGE_SIZE as i64;
-    let pages =
-        ((stats.total + page - 1) / page).max(if stats.total > 0 { 1 } else { 0 });
+    let pages = ((stats.total + page - 1) / page).max(if stats.total > 0 { 1 } else { 0 });
     ui.set_page_count(pages as i32);
     Ok(())
 }
@@ -188,8 +190,12 @@ fn refresh_proposals(ui: &AppWindow, db: &Db) {
 }
 
 fn load_entry_detail(ui: &AppWindow, db: &Db, id: &str) {
-    let Some(project) = current_project(db) else { return };
-    let Some(entry) = db.source_by_id(id).ok().flatten() else { return };
+    let Some(project) = current_project(db) else {
+        return;
+    };
+    let Some(entry) = db.source_by_id(id).ok().flatten() else {
+        return;
+    };
     ui.set_sel_id(id.into());
     ui.set_sel_original(entry.source.source_text.clone().into());
     ui.set_sel_status(entry.status.as_str().into());
@@ -232,7 +238,8 @@ fn load_entry_detail(ui: &AppWindow, db: &Db, id: &str) {
 // ------------------------------------------------------- settings utilities
 
 fn setting_or(db: &Db, key: &str, default: &str) -> String {
-    db.setting_get_or(key, default).unwrap_or_else(|_| default.to_string())
+    db.setting_get_or(key, default)
+        .unwrap_or_else(|_| default.to_string())
 }
 
 fn parse_or<T: std::str::FromStr>(db: &Db, key: &str, default: T) -> T {
@@ -248,6 +255,20 @@ fn context_window(db: &Db) -> ContextWindow {
         before: parse_or::<u32>(db, "context_before", 1).clamp(0, 10),
         after: parse_or::<u32>(db, "context_after", 1).clamp(0, 10),
     }
+}
+
+fn thai_dialogue_font_scale_percent(db: &Db) -> f32 {
+    db.setting_get("thai_dialogue_font_scale")
+        .ok()
+        .flatten()
+        .or_else(|| db.setting_get("thai_font_scale").ok().flatten())
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(100.0)
+        .clamp(50.0, 150.0)
+}
+
+fn thai_ui_font_scale_percent(db: &Db) -> f32 {
+    parse_or::<f32>(db, "thai_ui_font_scale", 80.0).clamp(50.0, 150.0)
 }
 
 fn preset_index_for(endpoint: &str) -> i32 {
@@ -383,6 +404,11 @@ fn load_settings(ui: &AppWindow, db: &Db) {
     ui.set_set_concurrency(parse_or::<usize>(db, "concurrency", 2).to_string().into());
     ui.set_set_context_before(parse_or::<u32>(db, "context_before", 1).to_string().into());
     ui.set_set_context_after(parse_or::<u32>(db, "context_after", 1).to_string().into());
+    let legacy_thai_font_scale = setting_or(db, "thai_font_scale", "100");
+    ui.set_set_thai_dialogue_scale(
+        setting_or(db, "thai_dialogue_font_scale", &legacy_thai_font_scale).into(),
+    );
+    ui.set_set_thai_ui_scale(setting_or(db, "thai_ui_font_scale", "80").into());
     ui.set_set_export_to_none(setting_or(db, "export_to_none", "0") == "1");
     let prompt = db
         .setting_get("prompt_template")
@@ -413,8 +439,10 @@ fn refresh_profiles(ui: &AppWindow, db: &Db) {
 /// Glossary = extraction).
 fn refresh_profile_pickers(ui: &AppWindow, db: &Db) {
     let profiles = db.ai_profile_list().unwrap_or_default();
-    let names: Vec<SharedString> =
-        profiles.iter().map(|p| SharedString::from(p.name.clone())).collect();
+    let names: Vec<SharedString> = profiles
+        .iter()
+        .map(|p| SharedString::from(p.name.clone()))
+        .collect();
     let model = ModelRc::from(Rc::new(VecModel::from(names)));
 
     ui.set_translation_profile_items(model.clone());
@@ -422,10 +450,7 @@ fn refresh_profile_pickers(ui: &AppWindow, db: &Db) {
 
     let index_for = |purpose: &str| {
         let want = db.setting_get(purpose).ok().flatten().unwrap_or_default();
-        profiles
-            .iter()
-            .position(|p| p.id == want)
-            .unwrap_or(0) as i32
+        profiles.iter().position(|p| p.id == want).unwrap_or(0) as i32
     };
     ui.set_translation_profile_index(index_for(crate::database::PURPOSE_TRANSLATION));
     ui.set_glossary_profile_index(index_for(crate::database::PURPOSE_GLOSSARY));
@@ -528,9 +553,9 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
             ui.set_ed_endpoint(endpoint.into());
             ui.set_ed_api_key(String::new().into());
             let model = default_model_for("openai").to_string();
-            ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
-                model.clone(),
-            )]))));
+            ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![
+                SharedString::from(model.clone()),
+            ]))));
             ui.set_ed_model_index(0);
             ui.set_ed_model(model.into());
             ui.set_ed_temperature("0.3".into());
@@ -545,7 +570,9 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
         let editing_weak = Arc::clone(&editing);
         ui.on_profile_edit(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(p) = db.ai_profile_get(&id).ok().flatten() else { return };
+            let Some(p) = db.ai_profile_get(&id).ok().flatten() else {
+                return;
+            };
             ui.set_ed_name(p.name.clone().into());
             ui.set_ed_preset(preset_index_for(&p.endpoint));
             ui.set_ed_endpoint(p.endpoint.clone().into());
@@ -555,9 +582,9 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
             } else {
                 p.model.clone()
             };
-            ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![SharedString::from(
-                model.clone(),
-            )]))));
+            ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(vec![
+                SharedString::from(model.clone()),
+            ]))));
             ui.set_ed_model_index(0);
             ui.set_ed_model(model.into());
             ui.set_ed_temperature(format!("{:.2}", p.temperature).into());
@@ -604,14 +631,16 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
                         models.sort();
                         models.dedup();
                         if models.is_empty() {
-                            ui.set_ed_error("The provider returned no models — check the endpoint/API key.".into());
+                            ui.set_ed_error(
+                                "The provider returned no models — check the endpoint/API key."
+                                    .into(),
+                            );
                             return;
                         }
                         if !current.is_empty() && !models.iter().any(|m| *m == current) {
                             models.insert(0, current.clone());
                         }
-                        let index =
-                            models.iter().position(|m| *m == current).unwrap_or(0);
+                        let index = models.iter().position(|m| *m == current).unwrap_or(0);
                         let items: Vec<SharedString> =
                             models.into_iter().map(SharedString::from).collect();
                         ui.set_ed_model_items(ModelRc::from(Rc::new(VecModel::from(items))));
@@ -667,14 +696,9 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
                 return;
             }
             let editing_id = editing_weak.lock().unwrap().clone();
-            let dup = db
-                .ai_profile_list()
-                .unwrap_or_default()
-                .iter()
-                .any(|p| {
-                    p.name.eq_ignore_ascii_case(&name)
-                        && editing_id.as_deref() != Some(p.id.as_str())
-                });
+            let dup = db.ai_profile_list().unwrap_or_default().iter().any(|p| {
+                p.name.eq_ignore_ascii_case(&name) && editing_id.as_deref() != Some(p.id.as_str())
+            });
             if dup {
                 ui.set_ed_error(format!("A profile named \"{name}\" already exists.").into());
                 return;
@@ -696,7 +720,12 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
                 return;
             }
             // First profile becomes the active one.
-            if db.setting_get("active_profile_translation").ok().flatten().is_none() {
+            if db
+                .setting_get("active_profile_translation")
+                .ok()
+                .flatten()
+                .is_none()
+            {
                 let _ = db.setting_set("active_profile_translation", &profile.id);
             }
             ui.set_ed_visible(false);
@@ -719,9 +748,7 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
                 .find(|p| p.name.as_str() == name.as_str());
             if let Some(p) = found {
                 let _ = db.setting_set(crate::database::PURPOSE_TRANSLATION, &p.id);
-                ui.set_status_message(
-                    format!("Translation provider: {}", p.name).into(),
-                );
+                ui.set_status_message(format!("Translation provider: {}", p.name).into());
             }
         });
     }
@@ -789,6 +816,18 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
     }
     {
         let db = db.clone();
+        ui.on_save_thai_dialogue_scale(move |v| {
+            let _ = db.setting_set("thai_dialogue_font_scale", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_thai_ui_scale(move |v| {
+            let _ = db.setting_set("thai_ui_font_scale", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
         ui.on_save_export_to_none(move |v| {
             let _ = db.setting_set("export_to_none", if v { "1" } else { "0" });
         });
@@ -846,7 +885,9 @@ fn fr_compute(
     let mut total = 0;
     let mut previews = Vec::new();
     for e in entries {
-        let Some(text) = e.translated_text.as_deref() else { continue };
+        let Some(text) = e.translated_text.as_deref() else {
+            continue;
+        };
         if !re.is_match(text) {
             continue;
         }
@@ -943,7 +984,11 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             let progress_ui = ui_weak.clone();
             let progress = move |p: pipeline::Progress| {
                 let _ = progress_ui.upgrade_in_event_loop(move |ui| {
-                    let frac = if p.total == 0 { 1.0 } else { p.done as f32 / p.total as f32 };
+                    let frac = if p.total == 0 {
+                        1.0
+                    } else {
+                        p.done as f32 / p.total as f32
+                    };
                     ui.set_progress(frac);
                     ui.set_status_message(
                         format!(
@@ -1013,11 +1058,10 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             let Some(ui) = weak.upgrade() else { return };
             // Start next to the current project, else in the home directory.
             let start = match ui.get_project_path().to_string() {
-                p if !p.is_empty() => Path::new(&p)
-                    .parent()
-                    .map(fp_normalize)
+                p if !p.is_empty() => Path::new(&p).parent().map(fp_normalize).unwrap_or_default(),
+                _ => dirs::home_dir()
+                    .map(|p| fp_normalize(&p))
                     .unwrap_or_default(),
-                _ => dirs::home_dir().map(|p| fp_normalize(&p)).unwrap_or_default(),
             };
             fp_load_dir(&ui, &start);
             ui.set_fp_visible(true);
@@ -1029,7 +1073,10 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             let Some(ui) = weak.upgrade() else { return };
             let cur = ui.get_fp_path().to_string();
             let target = if name.as_str() == ".." {
-                Path::new(&cur).parent().map(fp_normalize).unwrap_or_default()
+                Path::new(&cur)
+                    .parent()
+                    .map(fp_normalize)
+                    .unwrap_or_default()
             } else if cur.is_empty() {
                 name.to_string() // a drive root like "C:\"
             } else {
@@ -1160,7 +1207,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_prev_page(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             ui.set_page((ui.get_page() - 1).max(0));
             refresh_entries(&ui, &db, &project);
         });
@@ -1170,7 +1219,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_next_page(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             ui.set_page((ui.get_page() + 1).min(ui.get_page_count().saturating_sub(1)));
             refresh_entries(&ui, &db, &project);
         });
@@ -1218,7 +1269,11 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                 let lang = project_language(&db);
                 let _ = crate::translation::memory::store(
                     &db,
-                    &[(entry.source.source_hash, entry.source.source_text, text.to_string())],
+                    &[(
+                        entry.source.source_hash,
+                        entry.source.source_text,
+                        text.to_string(),
+                    )],
                     &lang,
                 );
                 ui.set_sel_status("edited".into());
@@ -1240,20 +1295,30 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             if id.is_empty() || ui.get_running() {
                 return;
             }
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             let profile = db
                 .ai_profile_for_purpose(crate::database::PURPOSE_TRANSLATION)
                 .ok();
-            let endpoint = profile.as_ref().map(|p| p.endpoint.clone()).unwrap_or_default();
-            let key = profile.as_ref().map(|p| p.api_key.clone()).unwrap_or_default();
+            let endpoint = profile
+                .as_ref()
+                .map(|p| p.endpoint.clone())
+                .unwrap_or_default();
+            let key = profile
+                .as_ref()
+                .map(|p| p.api_key.clone())
+                .unwrap_or_default();
             if needs_api_key(&endpoint) && key.trim().is_empty() {
                 ui.set_status_message(
-                    "API key is not configured — set one in Settings for this profile."
-                        .into(),
+                    "API key is not configured — set one in Settings for this profile.".into(),
                 );
                 return;
             }
-            if db.set_translation(&id, None, TranslationStatus::Pending).is_err() {
+            if db
+                .set_translation(&id, None, TranslationStatus::Pending)
+                .is_err()
+            {
                 return;
             }
             ui.set_running(true);
@@ -1286,13 +1351,11 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                     let _ = refresh_stats(&ui, &db, &project);
                     refresh_entries(&ui, &db, &project);
                     load_entry_detail(&ui, &db, &id);
-                    ui.set_status_message(
-                        if summary.translated > 0 {
-                            "Re-translated.".into()
-                        } else {
-                            "Re-translate failed — see the status column.".into()
-                        },
-                    );
+                    ui.set_status_message(if summary.translated > 0 {
+                        "Re-translated.".into()
+                    } else {
+                        "Re-translate failed — see the status column.".into()
+                    });
                 });
             });
         });
@@ -1362,6 +1425,8 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                             &entries,
                             &project.target_language,
                             setting_or(&db, "export_to_none", "0") == "1",
+                            thai_dialogue_font_scale_percent(&db),
+                            thai_ui_font_scale_percent(&db),
                         )?;
                         Ok((entries.len(), report))
                     })();
@@ -1388,7 +1453,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_extract_glossary(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             ui.set_gp_busy(true);
             ui.set_gp_status("".into());
             ui.set_status_message("Extracting glossary: mining candidate terms…".into());
@@ -1403,9 +1470,8 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                     }
                     let provider = build_provider(&db, crate::database::PURPOSE_GLOSSARY);
                     let lang = project_language(&db);
-                    let proposals = crate::glossary_ai::propose_glossary(
-                        &provider, &lang, &candidates, 50,
-                    )?;
+                    let proposals =
+                        crate::glossary_ai::propose_glossary(&provider, &lang, &candidates, 50)?;
                     db.glossary_proposals_replace(&project.id, &proposals)
                 })();
                 let _ = ui_weak.upgrade_in_event_loop(move |ui| {
@@ -1418,9 +1484,7 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                                 format!("{count} glossary proposals ready for review.").into(),
                             );
                         }
-                        Ok(_) => ui.set_status_message(
-                            "AI found no new glossary terms.".into(),
-                        ),
+                        Ok(_) => ui.set_status_message("AI found no new glossary terms.".into()),
                         Err(e) => ui.set_status_message(
                             format!("Glossary extraction failed: {e:#}").into(),
                         ),
@@ -1434,7 +1498,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_gp_accept(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             let proposals = db.glossary_proposals_list(&project.id).unwrap_or_default();
             if let Some(p) = proposals.iter().find(|p| p.id == id.as_str()) {
                 let _ = db.glossary_add(&project.id, &p.source, &p.target, None);
@@ -1459,11 +1525,16 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_gp_accept_all(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             let proposals = db.glossary_proposals_list(&project.id).unwrap_or_default();
             let mut added = 0;
             for p in &proposals {
-                if db.glossary_add(&project.id, &p.source, &p.target, None).is_ok() {
+                if db
+                    .glossary_add(&project.id, &p.source, &p.target, None)
+                    .is_ok()
+                {
                     added += 1;
                 }
             }
@@ -1479,7 +1550,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_gp_discard(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             let _ = db.glossary_proposals_clear(&project.id);
             refresh_proposals(&ui, &db);
             ui.set_gp_visible(false);
@@ -1506,7 +1579,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let cancel = cancel.clone();
         ui.on_rt_confirm(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             let scope_all = ui.get_rt_scope() == 1;
             let ignore_tm = ui.get_rt_ignore_tm();
 
@@ -1532,7 +1607,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             };
             let reset = db.translations_reset_pending(&project.id, ids.as_deref());
             if let Ok(n) = reset {
-                ui.set_status_message(format!("Re-translate: {n} entries reset ({scope_note}).").into());
+                ui.set_status_message(
+                    format!("Re-translate: {n} entries reset ({scope_note}).").into(),
+                );
             }
             ui.set_rt_visible(false);
             spawn_translation_run(&ui, &db, &cancel, &project, ignore_tm);
@@ -1553,8 +1630,12 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_qa_check(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
-            let Some(engine) = engine_for(&project) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
+            let Some(engine) = engine_for(&project) else {
+                return;
+            };
             let issues = crate::qa::scan(&db, &project.id, engine);
             let total = issues.len();
             let rows: Vec<QaRow> = issues
@@ -1585,8 +1666,12 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_qa_jump(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
-            let Some(entry) = db.source_by_id(&id).ok().flatten() else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
+            let Some(entry) = db.source_by_id(&id).ok().flatten() else {
+                return;
+            };
             let Ok(rank) = db.entry_rank(&project.id, &entry.source.file_path, entry.source.line)
             else {
                 return;
@@ -1625,7 +1710,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_fr_preview_run(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             let (total, previews) = match fr_compute(&ui, &db, &project) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1638,7 +1725,11 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                 .map(|(old, new)| SharedString::from(format!("{old}  →  {new}")))
                 .collect();
             ui.set_fr_count(
-                format!("{total} translations match — showing the first {}", rows.len()).into(),
+                format!(
+                    "{total} translations match — showing the first {}",
+                    rows.len()
+                )
+                .into(),
             );
             ui.set_fr_preview(ModelRc::from(Rc::new(VecModel::from(rows))));
         });
@@ -1648,7 +1739,9 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
         let db = db.clone();
         ui.on_fr_replace_all(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(project) = current_project(&db) else { return };
+            let Some(project) = current_project(&db) else {
+                return;
+            };
             let find = ui.get_fr_find().trim().to_string();
             if find.is_empty() {
                 ui.set_fr_count("Enter text to find first.".into());
@@ -1659,12 +1752,16 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                 return;
             };
             let replace = ui.get_fr_replace().to_string();
-            let Some(engine) = engine_for(&project) else { return };
+            let Some(engine) = engine_for(&project) else {
+                return;
+            };
             let entries = db.all_entries(&project.id).unwrap_or_default();
             let mut updates: Vec<(String, String)> = Vec::new();
             let mut skipped = 0;
             for e in entries {
-                let Some(text) = e.translated_text.as_deref() else { continue };
+                let Some(text) = e.translated_text.as_deref() else {
+                    continue;
+                };
                 if !re.is_match(text) {
                     continue;
                 }
@@ -1675,10 +1772,7 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                 // Never let a replacement destroy protected tokens.
                 let tokens = engine.protected_tokens(&e.source.source_text);
                 let lowered = new_text.to_lowercase();
-                if tokens
-                    .iter()
-                    .any(|t| !lowered.contains(&t.to_lowercase()))
-                {
+                if tokens.iter().any(|t| !lowered.contains(&t.to_lowercase())) {
                     skipped += 1;
                     continue;
                 }
@@ -1754,14 +1848,17 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             }
             let id = ui.get_gl_id().to_string();
             let saved = if id.is_empty() {
-                current_project(&db).and_then(|p| {
-                    db.glossary_add(&p.id, &source, &target, Some(&note)).ok()
-                })
+                current_project(&db)
+                    .and_then(|p| db.glossary_add(&p.id, &source, &target, Some(&note)).ok())
             } else {
                 db.glossary_get(&id).ok().flatten().map(|mut g| {
                     g.source = source.clone();
                     g.target = target.clone();
-                    g.note = if note.is_empty() { None } else { Some(note.clone()) };
+                    g.note = if note.is_empty() {
+                        None
+                    } else {
+                        Some(note.clone())
+                    };
                     db.glossary_update(&g).ok();
                     g
                 })

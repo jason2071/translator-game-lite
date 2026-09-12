@@ -131,7 +131,10 @@ pub fn translate_entries(params: PipelineParams<'_>, entries: Vec<TranslationEnt
     let config = params.config;
     let lang = params.project.target_language.as_str();
     let total = entries.len();
-    let mut summary = Summary { requested: total, ..Summary::default() };
+    let mut summary = Summary {
+        requested: total,
+        ..Summary::default()
+    };
 
     if params.cancel.load(Ordering::Relaxed) {
         summary.cancelled = true;
@@ -150,7 +153,9 @@ pub fn translate_entries(params: PipelineParams<'_>, entries: Vec<TranslationEnt
         let memory_hit = if params.config.ignore_memory {
             None
         } else {
-            memory::lookup(params.db, &entry.source.source_hash, lang).ok().flatten()
+            memory::lookup(params.db, &entry.source.source_hash, lang)
+                .ok()
+                .flatten()
         };
         match memory_hit {
             Some(text) if !text.trim().is_empty() => {
@@ -171,8 +176,10 @@ pub fn translate_entries(params: PipelineParams<'_>, entries: Vec<TranslationEnt
         .db
         .glossary_enabled(&params.project.id)
         .unwrap_or_default();
-    let batches: VecDeque<Vec<TranslationEntry>> =
-        remaining.chunks(config.batch_size.max(1)).map(<[TranslationEntry]>::to_vec).collect();
+    let batches: VecDeque<Vec<TranslationEntry>> = remaining
+        .chunks(config.batch_size.max(1))
+        .map(<[TranslationEntry]>::to_vec)
+        .collect();
     let queue = Mutex::new(batches);
     let outcome = Mutex::new(summary.clone());
 
@@ -238,7 +245,11 @@ fn process_batch(
         let context = build_context(params, entry);
         let context_str = {
             let formatted = context.format_prompt();
-            if formatted.is_empty() { None } else { Some(formatted) }
+            if formatted.is_empty() {
+                None
+            } else {
+                Some(formatted)
+            }
         };
         items.push(RequestItem {
             id: entry.source.id.clone(),
@@ -246,7 +257,11 @@ fn process_batch(
             context: context_str,
         });
     }
-    let batch_text = items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join("\n");
+    let batch_text = items
+        .iter()
+        .map(|i| i.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let active_glossary: Vec<&GlossaryEntry> = glossary::matches_for_text(glossary, &batch_text);
     let system_prompt = build_system_prompt(
         &config.prompt_template,
@@ -255,7 +270,10 @@ fn process_batch(
         &active_glossary,
     );
 
-    let request = TranslationRequest { system_prompt, items };
+    let request = TranslationRequest {
+        system_prompt,
+        items,
+    };
     let response = match params.provider.translate(&request) {
         Ok(response) => response,
         Err(e) => {
@@ -275,7 +293,12 @@ fn process_batch(
         .map(|t| (t.id, t.text))
         .collect();
 
-    let mut outcome = BatchOutcome { translated: 0, failed: 0, provider_errors: false, error: None };
+    let mut outcome = BatchOutcome {
+        translated: 0,
+        failed: 0,
+        provider_errors: false,
+        error: None,
+    };
     let mut memory_rows: Vec<(String, String, String)> = Vec::new();
     for entry in batch {
         match by_id.get(&entry.source.id) {
@@ -309,9 +332,10 @@ fn process_batch(
             _ => {
                 // Missing id in the response (or an unexpected one that was
                 // dropped): mark failed so the user can retry deliberately.
-                let _ = params
-                    .db
-                    .set_translation(&entry.source.id, None, TranslationStatus::Failed);
+                let _ =
+                    params
+                        .db
+                        .set_translation(&entry.source.id, None, TranslationStatus::Failed);
                 outcome.failed += 1;
             }
         }
@@ -537,7 +561,10 @@ mod tests {
         assert!(v[0].contains("protected token"));
 
         // Empty.
-        assert_eq!(validate_item("x", "   ", &[], &[]), vec!["empty translation"]);
+        assert_eq!(
+            validate_item("x", "   ", &[], &[]),
+            vec!["empty translation"]
+        );
     }
 
     #[test]
@@ -550,12 +577,7 @@ mod tests {
             note: None,
             enabled: true,
         };
-        let prompt = build_system_prompt(
-            default_prompt_template(),
-            "English",
-            "Thai",
-            &[&g],
-        );
+        let prompt = build_system_prompt(default_prompt_template(), "English", "Thai", &[&g]);
         assert!(prompt.contains("from English to Thai"));
         assert!(prompt.contains("Alice = อลิซ"));
 
@@ -613,7 +635,12 @@ mod tests {
             pending(&db, &project),
         );
         assert_eq!(
-            (summary.requested, summary.translated, summary.failed, summary.from_memory),
+            (
+                summary.requested,
+                summary.translated,
+                summary.failed,
+                summary.from_memory
+            ),
             (3, 2, 1, 0)
         );
 
@@ -661,7 +688,10 @@ mod tests {
         let provider = FakeProvider {
             respond: Box::new(|_| Err(anyhow::anyhow!("network down"))),
         };
-        let summary = translate_entries(params(&db, &project, &provider, &noop), pending(&db, &project));
+        let summary = translate_entries(
+            params(&db, &project, &provider, &noop),
+            pending(&db, &project),
+        );
         assert_eq!(summary.provider_errors, 1); // one batch of size 2
         assert_eq!(summary.translated + summary.failed, 0);
         assert_eq!(db.pending_entries(&project.id).unwrap().len(), 2);
@@ -683,9 +713,18 @@ mod tests {
         let provider = FakeProvider {
             respond: Box::new(|_| panic!("provider must not be called on TM hit")),
         };
-        let summary = translate_entries(params(&db, &project, &provider, &noop), pending(&db, &project));
-        assert_eq!((summary.from_memory, summary.translated, summary.failed), (1, 0, 0));
-        let entry = db.source_by_id(&format!("{}|script.rpy|1", project.id)).unwrap().unwrap();
+        let summary = translate_entries(
+            params(&db, &project, &provider, &noop),
+            pending(&db, &project),
+        );
+        assert_eq!(
+            (summary.from_memory, summary.translated, summary.failed),
+            (1, 0, 0)
+        );
+        let entry = db
+            .source_by_id(&format!("{}|script.rpy|1", project.id))
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.translated_text.as_deref(), Some("สวัสดี"));
     }
 

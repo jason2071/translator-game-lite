@@ -1,5 +1,5 @@
-pub mod extractor;
 pub mod exporter;
+pub mod extractor;
 pub mod parser;
 pub mod rpa;
 
@@ -58,12 +58,21 @@ impl GameEngine for RenpyEngine {
         translations: &[TranslationEntry],
         target_language: &str,
         to_default_language: bool,
+        thai_dialogue_font_scale_percent: f32,
+        thai_ui_font_scale_percent: f32,
     ) -> Result<ExportReport> {
         let root = crate::core::engine::game_root(path);
         if !root.is_dir() {
             anyhow::bail!("game directory not found: {}", root.display());
         }
-        exporter::export(&root, translations, target_language, to_default_language)
+        exporter::export_with_thai_font_scales(
+            &root,
+            translations,
+            target_language,
+            to_default_language,
+            thai_dialogue_font_scale_percent,
+            thai_ui_font_scale_percent,
+        )
     }
 
     fn protected_tokens(&self, text: &str) -> Vec<String> {
