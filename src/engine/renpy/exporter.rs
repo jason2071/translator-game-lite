@@ -13,6 +13,7 @@ use crate::core::engine::ExportReport;
 use crate::core::translation::TranslationEntry;
 
 use super::parser::{escape, keyword_is, keyword_string, scan_string};
+use super::rpa::RpaIndex;
 
 const THAI_FONT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -21,6 +22,10 @@ const THAI_FONT: &[u8] = include_bytes!(concat!(
 const THAI_FONT_OVERRIDE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/renpy/01_gtl_thai_font.rpy"
+));
+const NWHH_UI_SCALE_OVERRIDE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/renpy/02_gtl_nwhh_ui_scale.rpy"
 ));
 
 struct RawLine {
@@ -114,11 +119,14 @@ pub fn export(
         to_default_language,
         100.0,
         80.0,
+        75.0,
+        75.0,
     )
 }
 
 /// Variant of [`export`] that lets callers independently choose the dialogue
-/// and UI scales of the bundled Thai font. Values are clamped to 50–150%.
+/// UI, HUD and quest scales of the bundled Thai font. Values are clamped to
+/// 50–150%.
 pub fn export_with_thai_font_scales(
     game_root: &Path,
     translations: &[TranslationEntry],
@@ -126,6 +134,8 @@ pub fn export_with_thai_font_scales(
     to_default_language: bool,
     thai_dialogue_font_scale_percent: f32,
     thai_ui_font_scale_percent: f32,
+    thai_hud_font_scale_percent: f32,
+    thai_quest_font_scale_percent: f32,
 ) -> Result<ExportReport> {
     let mut with_text: Vec<&TranslationEntry> = Vec::new();
     for t in translations {
@@ -189,6 +199,8 @@ pub fn export_with_thai_font_scales(
             game_root,
             thai_dialogue_font_scale_percent,
             thai_ui_font_scale_percent,
+            thai_hud_font_scale_percent,
+            thai_quest_font_scale_percent,
         )?;
     }
     Ok(report)
@@ -201,6 +213,8 @@ fn install_thai_font(
     game_root: &Path,
     thai_dialogue_font_scale_percent: f32,
     thai_ui_font_scale_percent: f32,
+    thai_hud_font_scale_percent: f32,
+    thai_quest_font_scale_percent: f32,
 ) -> Result<usize> {
     let dir = game_root.join("tl").join("None");
     std::fs::create_dir_all(&dir)?;
@@ -214,6 +228,8 @@ fn install_thai_font(
     };
     let dialogue_scale = scale(thai_dialogue_font_scale_percent, 1.0);
     let ui_scale = scale(thai_ui_font_scale_percent, 0.8);
+    let hud_scale = scale(thai_hud_font_scale_percent, 0.75);
+    let quest_scale = scale(thai_quest_font_scale_percent, 0.75);
     std::fs::write(
         dir.join("01_gtl_thai_font.rpy"),
         THAI_FONT_OVERRIDE
@@ -223,7 +239,42 @@ fn install_thai_font(
             )
             .replace("__GTL_UI_FONT_SCALE__", &format!("{ui_scale:.2}")),
     )?;
+    let screen_override = dir.join("02_gtl_nwhh_ui_scale.rpy");
+    if has_nwhh_inline_hud_and_quest(game_root) {
+        std::fs::write(
+            screen_override,
+            NWHH_UI_SCALE_OVERRIDE
+                .replace("__GTL_HUD_FONT_SCALE__", &format!("{hud_scale:.2}"))
+                .replace("__GTL_QUEST_FONT_SCALE__", &format!("{quest_scale:.2}")),
+        )?;
+    } else {
+        let _ = std::fs::remove_file(screen_override);
+    }
     Ok(2)
+}
+
+/// Detect the exact inline screen set before exporting the optional override.
+/// The override is deliberately limited to Nothing Weird Happens Here: other
+/// Ren'Py games can use identical font mapping without depending on its HUD
+/// variables or `quest_journal` data model.
+fn has_nwhh_inline_hud_and_quest(game_root: &Path) -> bool {
+    let archive = game_root.join("archive.rpa");
+    let Ok(index) = RpaIndex::open(&archive) else {
+        return false;
+    };
+    index.names_with_extension(".rpy").into_iter().any(|name| {
+        index
+            .read_member(&archive, &name)
+            .map(|script| is_nwhh_inline_hud_and_quest(&script))
+            .unwrap_or(false)
+    })
+}
+
+fn is_nwhh_inline_hud_and_quest(script: &str) -> bool {
+    script.contains("screen quest_log():")
+        && script.contains("screen day_time_display():")
+        && script.contains("screen tooltip_display():")
+        && script.contains("quest_journal")
 }
 
 /// Write archive-sourced translations into `tl/<language>/<archive>_gtl.rpy`
@@ -631,6 +682,26 @@ mod tests {
     }
 
     #[test]
+    fn exports_manual_line_breaks_as_renpy_escapes() {
+        let root = temp_root("line-break");
+        let file = root.join("script.rpy");
+        fs::write(&file, "e \"Hello\"\n").unwrap();
+
+        export(
+            &root,
+            &[entry("script.rpy", 1, "Hello", "บรรทัดแรก\nบรรทัดถัดไป")],
+            "Thai",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            "e \"บรรทัดแรก\\nบรรทัดถัดไป\"\n"
+        );
+    }
+
+    #[test]
     fn rewrites_adjacent_new_line_for_old_entries() {
         let root = temp_root("oldnew");
         let file = root.join("tl/thai/script.rpy");
@@ -833,6 +904,8 @@ mod tests {
             false,
             200.0,
             10.0,
+            200.0,
+            10.0,
         )
         .unwrap();
 
@@ -844,6 +917,26 @@ mod tests {
             "{script}"
         );
         assert!(!script.contains("__GTL_UI_FONT_SCALE__"), "{script}");
+    }
+
+    #[test]
+    fn nwhh_scale_override_uses_only_its_own_placeholders() {
+        let script = NWHH_UI_SCALE_OVERRIDE
+            .replace("__GTL_HUD_FONT_SCALE__", "0.75")
+            .replace("__GTL_QUEST_FONT_SCALE__", "0.70");
+        assert!(script.contains("size int(44 * 0.75)"), "{script}");
+        assert!(script.contains("size int(26 * 0.70)"), "{script}");
+        assert!(!script.contains("__GTL_"), "{script}");
+    }
+
+    #[test]
+    fn nwhh_detection_requires_the_complete_screen_signature() {
+        assert!(is_nwhh_inline_hud_and_quest(
+            "screen quest_log():\nscreen day_time_display():\nscreen tooltip_display():\nquest_journal"
+        ));
+        assert!(!is_nwhh_inline_hud_and_quest(
+            "screen quest_log():\nscreen day_time_display():\nquest_journal"
+        ));
     }
 
     #[test]

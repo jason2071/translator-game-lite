@@ -237,9 +237,9 @@ fn classify_say_line(trimmed: &str) -> LineKind {
 }
 
 /// Extract string literals from the Ren'Py/Python patterns used by quest
-/// journals, plus static `text "..."` screen labels. We intentionally avoid
-/// arbitrary Python strings so URLs, keys, and implementation details remain
-/// outside the translation queue.
+/// journals and HUD controls, plus static `text "..."` screen labels. We
+/// intentionally avoid arbitrary Python strings so URLs, keys, and
+/// implementation details remain outside the translation queue.
 fn quest_and_screen_texts(line: &str) -> Vec<LineKind> {
     let strings = strings_in_line(line);
     if strings.is_empty() {
@@ -248,6 +248,15 @@ fn quest_and_screen_texts(line: &str) -> Vec<LineKind> {
 
     let indices: Vec<usize> = if line.contains("Quest(") || line.contains(".add_objective(") {
         strings.iter().map(|(index, _)| *index).collect()
+    } else if line.contains("create_nav_button(") {
+        // The project's navigation helper takes direction, destination, then
+        // the user-facing tooltip. Keep the first two implementation strings
+        // (such as `left` and `bedroom`) out of the translation queue.
+        strings.iter().nth(2).map(|(index, _)| *index).into_iter().collect()
+    } else if line.contains("SetVariable(\"tooltip_text\"") {
+        // `SetVariable("tooltip_text", "Phone")` is the other HUD-tooltip
+        // form used by this game's screens.
+        strings.iter().nth(1).map(|(index, _)| *index).into_iter().collect()
     } else if line.contains(".objectives[") && line.contains("[\"text\"]") {
         // The `"text"` dictionary key is not user-facing; the assignment
         // value after it is.
@@ -309,8 +318,8 @@ pub fn keyword_is<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
 
 /// Locate the first double-quoted string in `s`.
 /// Returns (start index of `"`, end index just past the closing `"`,
-/// unescaped content). `\"` and `\\` and `\'` are unescaped; unknown escapes
-/// (e.g. `\n`) are kept verbatim so export can round-trip them.
+/// unescaped content). Common Ren'Py escapes, including `\n`, are decoded so
+/// a translated paragraph survives a scan/export round trip.
 pub fn scan_string(s: &str) -> Option<(usize, usize, String)> {
     let start = s.find('"')?;
     let bytes = s.as_bytes();
@@ -334,6 +343,18 @@ pub fn scan_string(s: &str) -> Option<(usize, usize, String)> {
                     }
                     b'\\' => {
                         content.push('\\');
+                        i += 2;
+                    }
+                    b'n' => {
+                        content.push('\n');
+                        i += 2;
+                    }
+                    b'r' => {
+                        content.push('\r');
+                        i += 2;
+                    }
+                    b't' => {
+                        content.push('\t');
                         i += 2;
                     }
                     _ => {
@@ -371,6 +392,9 @@ pub fn escape(text: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
             other => out.push(other),
         }
     }
@@ -565,6 +589,27 @@ mod tests {
     }
 
     #[test]
+    fn navigation_tooltips_are_captured_without_internal_targets() {
+        let kinds = kinds(concat!(
+            "$ create_nav_button(10, 20, \"left\", \"bedroom\", \"2nd Floor\")\n",
+            "hovered SetVariable(\"tooltip_text\", \"Phone\")\n",
+        ));
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::ScriptText {
+                    text: "2nd Floor".into(),
+                    string_index: 2,
+                },
+                LineKind::ScriptText {
+                    text: "Phone".into(),
+                    string_index: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn labels_are_captured() {
         let kinds = kinds("label start:\nlabel my_scene_2:\n");
         assert_eq!(
@@ -609,6 +654,15 @@ mod tests {
     fn escape_roundtrip() {
         let original = "He said \"hi\" \\ ok";
         let escaped = escape(original);
+        let (_, _, unescaped) = scan_string(&format!("\"{}\"", escaped)).unwrap();
+        assert_eq!(unescaped, original);
+    }
+
+    #[test]
+    fn newline_escape_roundtrip() {
+        let original = "บรรทัดแรก\nบรรทัดถัดไป";
+        let escaped = escape(original);
+        assert_eq!(escaped, "บรรทัดแรก\\nบรรทัดถัดไป");
         let (_, _, unescaped) = scan_string(&format!("\"{}\"", escaped)).unwrap();
         assert_eq!(unescaped, original);
     }

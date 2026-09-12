@@ -271,6 +271,14 @@ fn thai_ui_font_scale_percent(db: &Db) -> f32 {
     parse_or::<f32>(db, "thai_ui_font_scale", 80.0).clamp(50.0, 150.0)
 }
 
+fn thai_hud_font_scale_percent(db: &Db) -> f32 {
+    parse_or::<f32>(db, "thai_hud_font_scale", 75.0).clamp(50.0, 150.0)
+}
+
+fn thai_quest_font_scale_percent(db: &Db) -> f32 {
+    parse_or::<f32>(db, "thai_quest_font_scale", 75.0).clamp(50.0, 150.0)
+}
+
 fn preset_index_for(endpoint: &str) -> i32 {
     let e = endpoint.to_lowercase();
     if e.contains("ollama.com") {
@@ -409,6 +417,8 @@ fn load_settings(ui: &AppWindow, db: &Db) {
         setting_or(db, "thai_dialogue_font_scale", &legacy_thai_font_scale).into(),
     );
     ui.set_set_thai_ui_scale(setting_or(db, "thai_ui_font_scale", "80").into());
+    ui.set_set_thai_hud_scale(setting_or(db, "thai_hud_font_scale", "75").into());
+    ui.set_set_thai_quest_scale(setting_or(db, "thai_quest_font_scale", "75").into());
     ui.set_set_export_to_none(setting_or(db, "export_to_none", "0") == "1");
     let prompt = db
         .setting_get("prompt_template")
@@ -824,6 +834,18 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
         let db = db.clone();
         ui.on_save_thai_ui_scale(move |v| {
             let _ = db.setting_set("thai_ui_font_scale", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_thai_hud_scale(move |v| {
+            let _ = db.setting_set("thai_hud_font_scale", v.trim());
+        });
+    }
+    {
+        let db = db.clone();
+        ui.on_save_thai_quest_scale(move |v| {
+            let _ = db.setting_set("thai_quest_font_scale", v.trim());
         });
     }
     {
@@ -1427,6 +1449,8 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                             setting_or(&db, "export_to_none", "0") == "1",
                             thai_dialogue_font_scale_percent(&db),
                             thai_ui_font_scale_percent(&db),
+                            thai_hud_font_scale_percent(&db),
+                            thai_quest_font_scale_percent(&db),
                         )?;
                         Ok((entries.len(), report))
                     })();

@@ -60,6 +60,8 @@ impl GameEngine for RenpyEngine {
         to_default_language: bool,
         thai_dialogue_font_scale_percent: f32,
         thai_ui_font_scale_percent: f32,
+        thai_hud_font_scale_percent: f32,
+        thai_quest_font_scale_percent: f32,
     ) -> Result<ExportReport> {
         let root = crate::core::engine::game_root(path);
         if !root.is_dir() {
@@ -72,6 +74,8 @@ impl GameEngine for RenpyEngine {
             to_default_language,
             thai_dialogue_font_scale_percent,
             thai_ui_font_scale_percent,
+            thai_hud_font_scale_percent,
+            thai_quest_font_scale_percent,
         )
     }
 

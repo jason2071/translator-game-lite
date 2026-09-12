@@ -28,8 +28,8 @@ pub fn hash_text(text: &str) -> String {
 }
 
 /// Remove space-like/invisible characters some models emit (zero-width
-/// spaces, fillers, NBSP, soft hyphens, ...) and collapse whitespace runs.
-/// Keeps list rendering left-aligned and game exports clean.
+/// spaces, fillers, NBSP, soft hyphens, ...) and collapse horizontal
+/// whitespace. Explicit line breaks are preserved for translated paragraphs.
 pub fn clean_spaces(text: &str) -> String {
     let mapped: String = text
         .chars()
@@ -53,7 +53,13 @@ pub fn clean_spaces(text: &str) -> String {
             }
         })
         .collect();
-    mapped.split_whitespace().collect::<Vec<_>>().join(" ")
+    mapped
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -83,5 +89,13 @@ mod tests {
         assert_eq!(clean_spaces("a\u{200b}b"), "a b");
         assert_eq!(clean_spaces("\u{feff}สวัสดี"), "สวัสดี");
         assert_eq!(clean_spaces("ok"), "ok");
+    }
+
+    #[test]
+    fn clean_spaces_preserves_manual_line_breaks() {
+        assert_eq!(
+            clean_spaces("  บรรทัดแรก   \r\n  บรรทัดถัดไป  \n\n  ย่อหน้าใหม่ "),
+            "บรรทัดแรก\nบรรทัดถัดไป\n\nย่อหน้าใหม่"
+        );
     }
 }

@@ -49,8 +49,8 @@ pub trait GameEngine: Sync {
     /// live inside .rpa archives). `to_default_language` writes those
     /// files into `tl/None` instead, applying them to the game's original
     /// language — for games that ship no language selector.
-    /// Thai-capable font exports may use separate scales for dialogue and
-    /// general UI text.
+    /// Thai-capable font exports may use separate scales for dialogue,
+    /// general UI text, and game-specific inline HUD/quest text.
     fn export(
         &self,
         path: &Path,
@@ -59,6 +59,8 @@ pub trait GameEngine: Sync {
         to_default_language: bool,
         thai_dialogue_font_scale_percent: f32,
         thai_ui_font_scale_percent: f32,
+        thai_hud_font_scale_percent: f32,
+        thai_quest_font_scale_percent: f32,
     ) -> Result<ExportReport>;
 
     /// Protected tokens (placeholders/tags) that must survive translation.
