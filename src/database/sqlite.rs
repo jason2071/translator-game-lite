@@ -261,25 +261,139 @@ impl Db {
 
     /// One page of the entry list (joined source + translation), ordered by
     /// file and line.
+    /// SQL fragment filtering by display status. `Some("pending")` means
+    /// untranslated (no row or pending); `Some("translated")` includes
+    /// manually edited entries.
+    fn status_condition(status: Option<&str>) -> &'static str {
+        match status {
+            Some("pending") => " AND (t.status IS NULL OR t.status = 'pending')",
+            Some("translated") => " AND t.status IN ('translated', 'edited')",
+            Some("failed") => " AND t.status = 'failed'",
+            _ => "",
+        }
+    }
+
     pub fn sources_page(
         &self,
         project_id: &str,
+        status: Option<&str>,
         offset: usize,
         limit: usize,
     ) -> Result<Vec<TranslationEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT s.id, s.engine_id, s.file_path, s.line, s.speaker, s.source_text, s.source_hash, s.context,
+                    t.translated_text, t.status, t.updated_at
+             FROM sources s LEFT JOIN translations t ON t.source_id = s.id
+             WHERE s.project_id = ?1{}
+             ORDER BY s.file_path, s.line
+             LIMIT ?2 OFFSET ?3",
+            Self::status_condition(status),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![project_id, limit as i64, offset as i64],
+                row_to_translation_entry,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Number of entries matching an optional status filter.
+    pub fn sources_count(&self, project_id: &str, status: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT COUNT(*) FROM sources s LEFT JOIN translations t ON t.source_id = s.id
+             WHERE s.project_id = ?1{}",
+            Self::status_condition(status),
+        );
+        let n: i64 = conn.query_row(&sql, params![project_id], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Every entry of a project, in file/line order (QA scan input).
+    pub fn all_entries(&self, project_id: &str) -> Result<Vec<TranslationEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT s.id, s.engine_id, s.file_path, s.line, s.speaker, s.source_text, s.source_hash, s.context,
                     t.translated_text, t.status, t.updated_at
              FROM sources s LEFT JOIN translations t ON t.source_id = s.id
              WHERE s.project_id = ?1
-             ORDER BY s.file_path, s.line
-             LIMIT ?2 OFFSET ?3",
+             ORDER BY s.file_path, s.line",
         )?;
         let rows = stmt
-            .query_map(params![project_id, limit as i64, offset as i64], row_to_translation_entry)?
+            .query_map(params![project_id], row_to_translation_entry)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// 1-based position of an entry in file/line order — lets the UI jump
+    /// to a page containing it.
+    pub fn entry_rank(&self, project_id: &str, file_path: &str, line: u32) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sources
+             WHERE project_id = ?1 AND (file_path < ?2 OR (file_path = ?2 AND line <= ?3))",
+            params![project_id, file_path, line],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Mark translations back to Pending so the next run re-translates
+    /// them. `None` = every entry of the project; `Some(ids)` = exactly
+    /// those entries. Returns the number of rows reset.
+    pub fn translations_reset_pending(
+        &self,
+        project_id: &str,
+        ids: Option<&[String]>,
+    ) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = crate::core::project::now_unix();
+        let mut n = 0;
+        match ids {
+            None => {
+                n = tx.execute(
+                    "UPDATE translations SET status = 'pending', updated_at = ?2
+                     WHERE source_id IN (SELECT id FROM sources WHERE project_id = ?1)",
+                    params![project_id, now],
+                )?;
+            }
+            Some(ids) => {
+                let mut stmt = tx.prepare(
+                    "UPDATE translations SET status = 'pending', updated_at = ?2
+                     WHERE source_id = ?1",
+                )?;
+                for id in ids {
+                    n += stmt.execute(params![id, now])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Apply translation text updates in one transaction (Find & Replace).
+    pub fn translations_replace_texts(&self, updates: &[(String, String)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = crate::core::project::now_unix();
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE translations SET translated_text = ?2, updated_at = ?3
+                 WHERE source_id = ?1",
+            )?;
+            for (id, text) in updates {
+                stmt.execute(params![id, text, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn source_by_id(&self, id: &str) -> Result<Option<TranslationEntry>> {
@@ -328,14 +442,17 @@ impl Db {
         term: &str,
         match_case: bool,
         whole_word: bool,
+        status: Option<&str>,
     ) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT s.id, s.source_text, t.translated_text
              FROM sources s LEFT JOIN translations t ON t.source_id = s.id
-             WHERE s.project_id = ?1
+             WHERE s.project_id = ?1{}
              ORDER BY s.file_path, s.line",
-        )?;
+            Self::status_condition(status),
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![project_id], |r| {
                 Ok((
@@ -360,23 +477,20 @@ impl Db {
         }
         let re = regex::Regex::new(&pattern)?;
 
-        let matched: Vec<String> = rows
-            .into_iter()
-            .filter(|(_, source, translation)| {
-                re.is_match(source)
-                    || translation
-                        .as_deref()
-                        .map(|t| re.is_match(t))
-                        .unwrap_or(false)
-            })
-            .map(|(id, _, _)| id)
-            .collect();
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[search] pattern={:?} matched={}",
-            pattern,
-            matched.len()
-        );
+        let matched: Vec<String> = if term.trim().is_empty() {
+            rows.into_iter().map(|(id, _, _)| id).collect()
+        } else {
+            rows.into_iter()
+                .filter(|(_, source, translation)| {
+                    re.is_match(source)
+                        || translation
+                            .as_deref()
+                            .map(|t| re.is_match(t))
+                            .unwrap_or(false)
+                })
+                .map(|(id, _, _)| id)
+                .collect()
+        };
         Ok(matched)
     }
 
@@ -1156,8 +1270,8 @@ mod tests {
         d.scan_apply(&p, &ExtractionResult { sources, existing_translations: vec![] })
             .unwrap();
 
-        let page0 = d.sources_page(&p.id, 0, 4).unwrap();
-        let page2 = d.sources_page(&p.id, 8, 4).unwrap();
+        let page0 = d.sources_page(&p.id, None, 0, 4).unwrap();
+        let page2 = d.sources_page(&p.id, None, 8, 4).unwrap();
         assert_eq!(page0.len(), 4);
         assert_eq!(page2.len(), 2);
         assert_eq!(page0[0].source.source_text, "Line 0");
@@ -1186,6 +1300,67 @@ mod tests {
             (stats.total, stats.translated, stats.pending, stats.failed),
             (10, 1, 8, 1)
         );
+
+        // Bulk re-translate reset: every translations row (scan_apply
+        // pre-creates one per entry) goes back to pending.
+        let reset = d
+            .translations_reset_pending(&p.id, None)
+            .unwrap();
+        assert_eq!(reset, 10);
+        assert_eq!(d.pending_entries(&p.id).unwrap().len(), 10);
+
+        // Scope by ids resets just those entries.
+        d.set_translation(
+            &format!("{}|script.rpy|3", p.id),
+            Some("สาม"),
+            TranslationStatus::Translated,
+        )
+        .unwrap();
+        d.set_translation(
+            &format!("{}|script.rpy|4", p.id),
+            Some("สี่"),
+            TranslationStatus::Translated,
+        )
+        .unwrap();
+        let ids = vec![format!("{}|script.rpy|3", p.id)];
+        let reset = d.translations_reset_pending(&p.id, Some(&ids)).unwrap();
+        assert_eq!(reset, 1);
+        let stats = d.stats(&p.id).unwrap();
+        assert_eq!(stats.translated, 1); // only row 4 stays translated
+    }
+
+    #[test]
+    fn translations_replace_texts_updates_one_transaction() {
+        let d = db();
+        let p = d.project_upsert(&project()).unwrap();
+        let sources: Vec<SourceEntry> = (0..3)
+            .map(|i| source(&format!("script.rpy|{}", i + 1), &format!("Line {}", i), i + 1))
+            .collect();
+        d.scan_apply(&p, &ExtractionResult { sources, existing_translations: vec![] })
+            .unwrap();
+        for i in 1..=3 {
+            d.set_translation(
+                &format!("{}|script.rpy|{i}", p.id),
+                Some(&format!("คำแปล {i}")),
+                TranslationStatus::Translated,
+            )
+            .unwrap();
+        }
+        d.translations_replace_texts(&[
+            (format!("{}|script.rpy|1", p.id), "แทน 1".into()),
+            (format!("{}|script.rpy|3", p.id), "แทน 3".into()),
+        ])
+        .unwrap();
+        let texts: Vec<String> = (1..=3)
+            .map(|i| {
+                d.source_by_id(&format!("{}|script.rpy|{i}", p.id))
+                    .unwrap()
+                    .unwrap()
+                    .translated_text
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(texts, vec!["แทน 1".to_string(), "คำแปล 2".to_string(), "แทน 3".to_string()]);
     }
 
     #[test]
@@ -1209,26 +1384,40 @@ mod tests {
         .unwrap();
 
         // Substring, case-insensitive: rows 1, 2, 3 (source) and 4 (translation).
-        let ids = d.search_entry_ids(&p.id, "jones", false, false).unwrap();
+        let ids = d.search_entry_ids(&p.id, "jones", false, false, None).unwrap();
         assert_eq!(ids.len(), 4);
 
         // Match case: row 2 (all lowercase) drops out.
-        let ids = d.search_entry_ids(&p.id, "Jones", true, false).unwrap();
+        let ids = d.search_entry_ids(&p.id, "Jones", true, false, None).unwrap();
         assert_eq!(ids.len(), 3);
 
         // Whole word: "Jonesy" (row 3) drops out, boundaries still match.
-        let ids = d.search_entry_ids(&p.id, "jones", false, true).unwrap();
+        let ids = d.search_entry_ids(&p.id, "jones", false, true, None).unwrap();
         assert_eq!(ids.len(), 3);
         assert!(ids.iter().all(|id| !id.ends_with("|3")));
 
         // Whole word + match case: only exact "Jones" tokens remain.
-        let ids = d.search_entry_ids(&p.id, "Jones", true, true).unwrap();
+        let ids = d.search_entry_ids(&p.id, "Jones", true, true, None).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().any(|id| id.ends_with("|1")));
         assert!(ids.iter().any(|id| id.ends_with("|4")));
 
+        // Status filter narrows the same search: rows 1-3 are untranslated,
+        // row 4 is Translated.
+        let ids = d
+            .search_entry_ids(&p.id, "jones", false, false, Some("pending"))
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        let ids = d
+            .search_entry_ids(&p.id, "jones", false, false, Some("translated"))
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.iter().any(|id| id.ends_with("|4")));
+        assert_eq!(d.sources_count(&p.id, Some("translated")).unwrap(), 1);
+
         // Entries can be fetched back in file/line order by id.
-        let rows = d.entries_by_ids(&ids).unwrap();
+        let whole = d.search_entry_ids(&p.id, "Jones", true, true, None).unwrap();
+        let rows = d.entries_by_ids(&whole).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].source.line, 1);
         assert_eq!(rows[1].source.line, 4);

@@ -7,6 +7,7 @@ mod core;
 mod database;
 mod engine;
 mod glossary_ai;
+mod qa;
 mod translation;
 mod ui;
 

@@ -31,6 +31,9 @@ pub struct PipelineConfig {
     pub concurrency: usize,
     pub context: ContextWindow,
     pub prompt_template: String,
+    /// When set, translation memory is skipped for this run so every entry
+    /// is freshly translated (bulk re-translate).
+    pub ignore_memory: bool,
 }
 
 impl Default for PipelineConfig {
@@ -42,6 +45,7 @@ impl Default for PipelineConfig {
             concurrency: 2,
             context: ContextWindow::default(),
             prompt_template: default_prompt_template().to_string(),
+            ignore_memory: false,
         }
     }
 }
@@ -135,15 +139,21 @@ pub fn translate_entries(params: PipelineParams<'_>, entries: Vec<TranslationEnt
     }
 
     // ---- Pass 1: translation memory (Glossary > TM > AI; exact hash hit
-    // means the AI is never called for repeated text).
+    // means the AI is never called for repeated text). Bulk re-translate
+    // skips this pass so entries are freshly translated.
     let mut remaining: Vec<TranslationEntry> = Vec::new();
     for entry in entries {
         if params.cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             break;
         }
-        match memory::lookup(params.db, &entry.source.source_hash, lang) {
-            Ok(Some(text)) if !text.trim().is_empty() => {
+        let memory_hit = if params.config.ignore_memory {
+            None
+        } else {
+            memory::lookup(params.db, &entry.source.source_hash, lang).ok().flatten()
+        };
+        match memory_hit {
+            Some(text) if !text.trim().is_empty() => {
                 let _ = params.db.set_translation(
                     &entry.source.id,
                     Some(&text),

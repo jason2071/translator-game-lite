@@ -24,6 +24,12 @@ export struct GlossaryProposalRow {
     occurrences: int,
 }
 
+export struct QaRow {
+    id: string,
+    loc: string,
+    label: string,
+}
+
 export struct ContextInfo {
     speaker: string,
     scene: string,
@@ -277,6 +283,7 @@ export component AppWindow inherits Window {
     in-out property <string> entry-search;
     in-out property <bool> entry-search-case; // match case
     in-out property <bool> entry-search-word; // match whole word
+    in-out property <int> status-filter-index; // 0=All, 1=Pending, 2=Translated, 3=Failed
 
     // ---- glossary
     in property <[GlossaryRow]> glossary;
@@ -335,6 +342,25 @@ export component AppWindow inherits Window {
     in property <[string]> fp-items;    // subdirectories, ".." first
     in-out property <string> fp-status; // error line
 
+    // ---- bulk re-translate confirmation
+    in-out property <bool> rt-visible;
+    in-out property <int> rt-scope;      // 0 = current search/filter, 1 = whole project
+    in-out property <bool> rt-ignore-tm; // skip translation memory for this run
+
+    // ---- QA report
+    in property <[QaRow]> qa-rows;
+    in-out property <bool> qa-visible;
+    in-out property <string> qa-summary;
+
+    // ---- find & replace (translations only)
+    in-out property <bool> fr-visible;
+    in-out property <string> fr-find;
+    in-out property <string> fr-replace;
+    in-out property <bool> fr-case;
+    in-out property <bool> fr-word;
+    in property <[string]> fr-preview;
+    in-out property <string> fr-count;
+
     callback browse-project();
     callback scan-project();
     callback start-translate();
@@ -376,6 +402,15 @@ export component AppWindow inherits Window {
     callback fp-go();
     callback fp-confirm();
     callback fp-cancel();
+    callback retranslate-open();
+    callback rt-confirm();
+    callback rt-cancel();
+    callback qa-check();
+    callback qa-jump(string);
+    callback fr-preview-run();
+    callback fr-replace-all();
+    callback fr-cancel();
+    callback fr-open();
     callback extract-glossary();
     callback gp-accept(string);
     callback gp-reject(string);
@@ -438,6 +473,18 @@ export component AppWindow inherits Window {
                         spacing: 6px;
                         HorizontalLayout {
                             spacing: 8px;
+                            Text {
+                                text: "Status";
+                                font-size: 11px;
+                                color: #777;
+                                vertical-alignment: center;
+                            }
+                            ComboBox {
+                                width: 120px;
+                                model: ["All", "Pending", "Translated", "Failed"];
+                                current-index <=> root.status-filter-index;
+                                selected(text) => { root.apply-entry-search(root.entry-search); }
+                            }
                             LineEdit {
                                 placeholder-text: "Search original / translation...";
                                 text <=> root.entry-search;
@@ -453,6 +500,10 @@ export component AppWindow inherits Window {
                                 text: "Whole word";
                                 checked <=> root.entry-search-word;
                                 toggled => { root.apply-entry-search(root.entry-search); }
+                            }
+                            Button {
+                                text: "Replace…";
+                                clicked => { root.fr-open(); }
                             }
                         }
                         // Header + row delegates MUST use the same column math.
@@ -647,6 +698,11 @@ export component AppWindow inherits Window {
                         enabled: root.project-path != "";
                         clicked => { root.start-translate(); }
                     }
+                    if !root.running : Button {
+                        text: "Re-translate…";
+                        enabled: root.project-path != "";
+                        clicked => { root.retranslate-open(); }
+                    }
                     if root.running : Button {
                         text: "Cancel";
                         clicked => { root.cancel-translate(); }
@@ -654,6 +710,11 @@ export component AppWindow inherits Window {
                     ProgressBar {
                         horizontal-stretch: 1;
                         progress: root.progress;
+                    }
+                    Button {
+                        text: "QA Check";
+                        enabled: root.project-path != "" && !root.running;
+                        clicked => { root.qa-check(); }
                     }
                     Button {
                         text: "Export";
@@ -1379,6 +1440,317 @@ export component AppWindow inherits Window {
                         danger: true;
                         enabled: root.gp-rows.length > 0;
                         clicked => { root.gp-discard(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // Bulk re-translate confirmation.
+    if root.rt-visible : Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #00000066;
+        TouchArea {}
+        rt_fs := FocusScope {
+            width: parent.width;
+            height: parent.height;
+            init => { rt_fs.focus(); }
+            key-pressed(e) => {
+                if e.text == Key.Escape {
+                    root.rt-cancel();
+                    accept
+                } else {
+                    reject
+                }
+            }
+            Rectangle {
+                width: min(470px, parent.width - 40px);
+                height: min(300px, parent.height - 40px);
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: white;
+                border-radius: 12px;
+                drop-shadow-blur: 28px;
+                drop-shadow-color: #00000045;
+                VerticalLayout {
+                    padding: 22px;
+                    spacing: 12px;
+
+                    Text {
+                        text: "Re-translate";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: #1a1a1a;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Scope";
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                        ComboBox {
+                            horizontal-stretch: 1;
+                            model: ["Current search / filter results", "Whole project"];
+                            current-index <=> root.rt-scope;
+                        }
+                    }
+
+                    CheckBox {
+                        text: "Ignore translation memory (translate fresh)";
+                        checked <=> root.rt-ignore-tm;
+                    }
+
+                    Text {
+                        text: "Existing translations inside the scope will be replaced.";
+                        font-size: 12px;
+                        color: #b58900;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 8px;
+                        DialogButton {
+                            label: "Cancel";
+                            clicked => { root.rt-cancel(); }
+                        }
+                        DialogButton {
+                            label: "Re-translate";
+                            danger: true;
+                            clicked => { root.rt-confirm(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // QA report overlay.
+    if root.qa-visible : Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #00000066;
+        TouchArea {}
+        Rectangle {
+            width: min(760px, parent.width - 40px);
+            height: min(540px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: white;
+            border-radius: 12px;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #00000045;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "QA Report";
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.qa-summary;
+                        font-size: 12px;
+                        color: #888;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    IconButton {
+                        source: @image-url("assets/x.svg");
+                        clicked => { root.qa-visible = false; }
+                    }
+                }
+
+                Rectangle {
+                    height: 26px;
+                    background: #eef0f5;
+                    border-radius: 4px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        spacing: 4px; // matches the row delegates below
+                        Text { text: "Location"; width: 260px; font-weight: 600; vertical-alignment: center; }
+                        Text { text: "Issue"; horizontal-stretch: 1; font-weight: 600; vertical-alignment: center; }
+                    }
+                }
+
+                Rectangle {
+                    clip: true;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: #e2e4ea;
+                    vertical-stretch: 1;
+                    ListView {
+                        for q[ix] in root.qa-rows: Rectangle {
+                            height: 34px;
+                            qa_ta := TouchArea {
+                                clicked => { root.qa-jump(q.id); }
+                                mouse-cursor: pointer;
+                            }
+                            background: qa_ta.has-hover ? #fdeaea : Math.mod(ix, 2) == 0 ? white : #fdf5f5;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                spacing: 4px;
+                                Text {
+                                    text: q.loc;
+                                    width: 260px;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                    font-size: 12px;
+                                    color: #666;
+                                }
+                                Text {
+                                    text: q.label;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                    color: #8a1f1f;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Click an issue to jump to the entry.";
+                    font-size: 11px;
+                    color: #888;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    DialogButton {
+                        label: "Close";
+                        primary: true;
+                        clicked => { root.qa-visible = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    // Find & Replace overlay (translations only).
+    if root.fr-visible : Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #00000066;
+        TouchArea {}
+        fr_fs := FocusScope {
+            width: parent.width;
+            height: parent.height;
+            init => { fr_fs.focus(); }
+            key-pressed(e) => {
+                if e.text == Key.Escape {
+                    root.fr-cancel();
+                    accept
+                } else {
+                    reject
+                }
+            }
+            Rectangle {
+                width: min(560px, parent.width - 40px);
+                height: min(480px, parent.height - 40px);
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: white;
+                border-radius: 12px;
+                drop-shadow-blur: 28px;
+                drop-shadow-color: #00000045;
+                VerticalLayout {
+                    padding: 22px;
+                    spacing: 10px;
+
+                    Text {
+                        text: "Find & Replace — translations only";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: #1a1a1a;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Find"; width: 90px; vertical-alignment: center; font-size: 13px; }
+                        LineEdit {
+                            text <=> root.fr-find;
+                            horizontal-stretch: 1;
+                            placeholder-text: "text to find";
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Replace"; width: 90px; vertical-alignment: center; font-size: 13px; }
+                        LineEdit {
+                            text <=> root.fr-replace;
+                            horizontal-stretch: 1;
+                            placeholder-text: "replacement text";
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 16px;
+                        CheckBox {
+                            text: "Match case";
+                            checked <=> root.fr-case;
+                        }
+                        CheckBox {
+                            text: "Whole word";
+                            checked <=> root.fr-word;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button {
+                            text: "Preview";
+                            clicked => { root.fr-preview-run(); }
+                        }
+                    }
+
+                    Rectangle {
+                        clip: true;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #e2e4ea;
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 4px;
+                            Text {
+                                text: root.fr-count;
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: #444;
+                            }
+                            ListView {
+                                for p in root.fr-preview: Text {
+                                    height: 22px;
+                                    text: p;
+                                    font-size: 11px;
+                                    color: #555;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 8px;
+                        DialogButton {
+                            label: "Replace All";
+                            danger: true;
+                            clicked => { root.fr-replace-all(); }
+                        }
+                        DialogButton {
+                            label: "Cancel";
+                            clicked => { root.fr-cancel(); }
+                        }
                     }
                 }
             }

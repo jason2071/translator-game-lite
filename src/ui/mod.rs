@@ -85,36 +85,41 @@ fn refresh_stats(ui: &AppWindow, db: &Db, project: &Project) -> Result<()> {
     Ok(())
 }
 
+/// Map the status-filter combo index to a DB status key (None = All).
+fn status_filter(ui: &AppWindow) -> Option<&'static str> {
+    match ui.get_status_filter_index() {
+        1 => Some("pending"),
+        2 => Some("translated"),
+        3 => Some("failed"),
+        _ => None,
+    }
+}
+
 fn refresh_entries(ui: &AppWindow, db: &Db, project: &Project) {
     let term = ui.get_entry_search().trim().to_string();
+    let status = status_filter(ui);
     // One page of rows plus the total the page counter should show.
     // With an active search the filter runs in Rust (for match-case /
     // whole-word support), producing an id list paginated here.
     let (rows, total) = if term.is_empty() {
-        let total = db.stats(&project.id).map(|s| s.total as usize).unwrap_or(0);
+        let total = db.sources_count(&project.id, status).unwrap_or(0);
         let pages = ((total + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
         let page = (ui.get_page() as usize).min(pages - 1);
         ui.set_page(page as i32);
         let rows = db
-            .sources_page(&project.id, page * PAGE_SIZE, PAGE_SIZE)
+            .sources_page(&project.id, status, page * PAGE_SIZE, PAGE_SIZE)
             .unwrap_or_default();
         (rows, total)
     } else {
-        let ids = db.search_entry_ids(
-            &project.id,
-            &term,
-            ui.get_entry_search_case(),
-            ui.get_entry_search_word(),
-        );
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[search] term={:?} case={} word={} ids={:?}",
-            term,
-            ui.get_entry_search_case(),
-            ui.get_entry_search_word(),
-            ids.as_ref().map(|v| v.len())
-        );
-        let ids = ids.unwrap_or_default();
+        let ids = db
+            .search_entry_ids(
+                &project.id,
+                &term,
+                ui.get_entry_search_case(),
+                ui.get_entry_search_word(),
+                status,
+            )
+            .unwrap_or_default();
         let total = ids.len();
         let pages = ((total + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
         let page = (ui.get_page() as usize).min(pages - 1);
@@ -326,6 +331,7 @@ fn pipeline_config(db: &Db, project: &Project) -> pipeline::PipelineConfig {
             .flatten()
             .filter(|p| !p.trim().is_empty())
             .unwrap_or_else(|| pipeline::default_prompt_template().to_string()),
+        ignore_memory: false,
     }
     .clamped()
 }
@@ -788,6 +794,64 @@ fn wire_settings_callbacks(ui: &AppWindow, db: Arc<Db>) {
     }
 }
 
+// --------------------------------------------------------- find & replace
+
+/// Regex for the Find & Replace dialog. The term is always capture group 1;
+/// in whole-word mode the boundary characters are groups 1 and 3 so they
+/// survive replacement.
+fn fr_build_regex(find: &str, match_case: bool, whole_word: bool) -> anyhow::Result<regex::Regex> {
+    let escaped = regex::escape(find);
+    let ci = if match_case { "" } else { "(?i)" };
+    let pattern = if whole_word {
+        format!("{ci}(^|\\W)({escaped})(?:$|\\W)")
+    } else {
+        format!("{ci}({escaped})")
+    };
+    Ok(regex::Regex::new(&pattern)?)
+}
+
+/// Replace every match inside one translation, keeping whole-word boundary
+/// characters intact.
+fn fr_replace_text(text: &str, re: &regex::Regex, replace: &str) -> String {
+    re.replace_all(text, |caps: &regex::Captures| {
+        if caps.len() >= 4 {
+            format!("{}{}{}", &caps[1], replace, &caps[3])
+        } else {
+            replace.to_string()
+        }
+    })
+    .into_owned()
+}
+
+/// Compute (match_count, first ten old→new previews) for the dialog.
+fn fr_compute(
+    ui: &AppWindow,
+    db: &Db,
+    project: &Project,
+) -> anyhow::Result<(usize, Vec<(String, String)>)> {
+    let find = ui.get_fr_find().trim().to_string();
+    if find.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+    let re = fr_build_regex(&find, ui.get_fr_case(), ui.get_fr_word())?;
+    let replace = ui.get_fr_replace().to_string();
+    let entries = db.all_entries(&project.id)?;
+    let mut total = 0;
+    let mut previews = Vec::new();
+    for e in entries {
+        let Some(text) = e.translated_text.as_deref() else { continue };
+        if !re.is_match(text) {
+            continue;
+        }
+        total += 1;
+        if previews.len() < 10 {
+            let new_text = fr_replace_text(text, &re, &replace);
+            previews.push((text.to_string(), new_text));
+        }
+    }
+    Ok((total, previews))
+}
+
 // --------------------------------------------------------- app callbacks
 
 /// Trim a trailing separator (drive roots like `C:\` keep theirs).
@@ -842,6 +906,98 @@ fn fp_load_dir(ui: &AppWindow, target: &str) {
 }
 
 fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
+    // Shared runner for "Translate pending" and bulk re-translate: spawns
+    // the pipeline on a background thread and streams progress back.
+    fn spawn_translation_run(
+        ui: &AppWindow,
+        db: &Arc<Db>,
+        cancel: &Arc<AtomicBool>,
+        project: &Project,
+        ignore_memory: bool,
+    ) {
+        ui.set_running(true);
+        ui.set_progress(0.0);
+        cancel.store(false, Ordering::Relaxed);
+
+        // Snapshot settings (auto-saved) on the UI thread.
+        let config = pipeline::PipelineConfig {
+            ignore_memory,
+            ..pipeline_config(db, project)
+        };
+        let provider = build_provider(db, crate::database::PURPOSE_TRANSLATION);
+
+        let ui_weak = ui.as_weak();
+        let db = db.clone();
+        let cancel = cancel.clone();
+        let project = project.clone();
+        std::thread::spawn(move || {
+            let engine = engine_for(&project);
+
+            let progress_ui = ui_weak.clone();
+            let progress = move |p: pipeline::Progress| {
+                let _ = progress_ui.upgrade_in_event_loop(move |ui| {
+                    let frac = if p.total == 0 { 1.0 } else { p.done as f32 / p.total as f32 };
+                    ui.set_progress(frac);
+                    ui.set_status_message(
+                        format!(
+                            "Translating… {}/{} (memory {}, translated {}, failed {})",
+                            p.done, p.total, p.from_memory, p.translated, p.failed
+                        )
+                        .into(),
+                    );
+                });
+            };
+
+            let summary = match engine {
+                Some(engine) => pipeline::translate_pending(pipeline::PipelineParams {
+                    db: &db,
+                    project: &project,
+                    provider: &provider,
+                    engine,
+                    config: &config,
+                    cancel: &cancel,
+                    on_progress: &progress,
+                })
+                .unwrap_or_default(),
+                None => {
+                    let _ = ui_weak.upgrade_in_event_loop(|ui| {
+                        ui.set_status_message("Unknown engine for project.".into());
+                    });
+                    pipeline::Summary::default()
+                }
+            };
+
+            let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+                ui.set_running(false);
+                ui.set_progress(1.0);
+                let _ = refresh_stats(&ui, &db, &project);
+                refresh_entries(&ui, &db, &project);
+                ui.set_status_message(
+                    if summary.cancelled {
+                        format!(
+                            "Cancelled — {} translated, {} failed, {} from memory (remaining entries stay pending).",
+                            summary.translated, summary.failed, summary.from_memory
+                        )
+                    } else {
+                        format!(
+                            "Done: {} translated, {} failed, {} from memory, {} request errors.",
+                            summary.translated, summary.failed, summary.from_memory, summary.provider_errors
+                        )
+                    }
+                    .into(),
+                );
+                if summary.provider_errors > 0 {
+                    if let Some(err) = &summary.last_error {
+                        let short: String = err.chars().take(150).collect();
+                        ui.set_status_message(
+                            format!("{} Last error: {}", ui.get_status_message(), short).into(),
+                        );
+                    }
+                }
+            });
+        });
+    }
+
     // --- Browse: open the in-app folder picker; picking a folder then
     //     detects the engine, creates/loads the project and scans it.
     {
@@ -1161,84 +1317,7 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
                 );
                 return;
             }
-            ui.set_running(true);
-            ui.set_progress(0.0);
-            cancel.store(false, Ordering::Relaxed);
-
-            // Snapshot settings (auto-saved) on the UI thread.
-            let config = pipeline_config(&db, &project);
-            let provider = build_provider(&db, crate::database::PURPOSE_TRANSLATION);
-
-            let ui_weak = ui.as_weak();
-            let db = db.clone();
-            let cancel = cancel.clone();
-            std::thread::spawn(move || {
-                let engine = engine_for(&project);
-
-                let progress_ui = ui_weak.clone();
-                let progress = move |p: pipeline::Progress| {
-                    let _ = progress_ui.upgrade_in_event_loop(move |ui| {
-                        let frac = if p.total == 0 { 1.0 } else { p.done as f32 / p.total as f32 };
-                        ui.set_progress(frac);
-                        ui.set_status_message(
-                            format!(
-                                "Translating… {}/{} (memory {}, translated {}, failed {})",
-                                p.done, p.total, p.from_memory, p.translated, p.failed
-                            )
-                            .into(),
-                        );
-                    });
-                };
-
-                let summary = match engine {
-                    Some(engine) => pipeline::translate_pending(pipeline::PipelineParams {
-                        db: &db,
-                        project: &project,
-                        provider: &provider,
-                        engine,
-                        config: &config,
-                        cancel: &cancel,
-                        on_progress: &progress,
-                    })
-                    .unwrap_or_default(),
-                    None => {
-                        let _ = ui_weak.upgrade_in_event_loop(|ui| {
-                            ui.set_status_message("Unknown engine for project.".into());
-                        });
-                        pipeline::Summary::default()
-                    }
-                };
-
-                let _ = ui_weak.upgrade_in_event_loop(move |ui| {
-                    ui.set_running(false);
-                    ui.set_progress(1.0);
-                    let _ = refresh_stats(&ui, &db, &project);
-                    refresh_entries(&ui, &db, &project);
-                    ui.set_status_message(
-                        if summary.cancelled {
-                            format!(
-                                "Cancelled — {} translated, {} failed, {} from memory (remaining entries stay pending).",
-                                summary.translated, summary.failed, summary.from_memory
-                            )
-                        } else {
-                            format!(
-                                "Done: {} translated, {} failed, {} from memory, {} request errors.",
-                                summary.translated, summary.failed, summary.from_memory, summary.provider_errors
-                            )
-                        }
-                        .into(),
-                    );
-                    if summary.provider_errors > 0 {
-                        if let Some(err) = &summary.last_error {
-                            let short: String = err.chars().take(150).collect();
-                            ui.set_status_message(
-                                format!("{} Last error: {}", ui.get_status_message(), short)
-                                    .into(),
-                            );
-                        }
-                    }
-                });
-            });
+            spawn_translation_run(&ui, &db, &cancel, &project, false);
         });
     }
     {
@@ -1397,6 +1476,235 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             refresh_proposals(&ui, &db);
             ui.set_gp_visible(false);
             ui.set_status_message("Glossary proposals discarded.".into());
+        });
+    }
+
+    // --- Bulk re-translate
+    {
+        let weak = ui.as_weak();
+        ui.on_retranslate_open(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.get_running() {
+                return;
+            }
+            ui.set_rt_scope(0);
+            ui.set_rt_ignore_tm(true);
+            ui.set_rt_visible(true);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        let cancel = cancel.clone();
+        ui.on_rt_confirm(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            let scope_all = ui.get_rt_scope() == 1;
+            let ignore_tm = ui.get_rt_ignore_tm();
+
+            // Resolve the id set for the "current search / filter" scope.
+            let ids: Option<Vec<String>> = if scope_all {
+                None
+            } else {
+                let term = ui.get_entry_search().trim().to_string();
+                Some(
+                    db.search_entry_ids(
+                        &project.id,
+                        &term,
+                        ui.get_entry_search_case(),
+                        ui.get_entry_search_word(),
+                        status_filter(&ui),
+                    )
+                    .unwrap_or_default(),
+                )
+            };
+            let scope_note = match &ids {
+                Some(ids) => format!("{} entries", ids.len()),
+                None => "whole project".into(),
+            };
+            let reset = db.translations_reset_pending(&project.id, ids.as_deref());
+            if let Ok(n) = reset {
+                ui.set_status_message(format!("Re-translate: {n} entries reset ({scope_note}).").into());
+            }
+            ui.set_rt_visible(false);
+            spawn_translation_run(&ui, &db, &cancel, &project, ignore_tm);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_rt_cancel(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_rt_visible(false);
+            }
+        });
+    }
+
+    // --- QA check
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_qa_check(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            let Some(engine) = engine_for(&project) else { return };
+            let issues = crate::qa::scan(&db, &project.id, engine);
+            let total = issues.len();
+            let rows: Vec<QaRow> = issues
+                .into_iter()
+                .take(300)
+                .map(|i| QaRow {
+                    id: i.source_id.into(),
+                    loc: format!("{}:{}", i.file, i.line).into(),
+                    label: i.label.into(),
+                })
+                .collect();
+            ui.set_qa_summary(
+                if total > rows.len() {
+                    format!("{} issues — showing the first {}", total, rows.len())
+                } else if total == 1 {
+                    "1 issue found".into()
+                } else {
+                    format!("{} issues found", total)
+                }
+                .into(),
+            );
+            ui.set_qa_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+            ui.set_qa_visible(true);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_qa_jump(move |id| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            let Some(entry) = db.source_by_id(&id).ok().flatten() else { return };
+            let Ok(rank) = db.entry_rank(&project.id, &entry.source.file_path, entry.source.line)
+            else {
+                return;
+            };
+            let pages = ((rank + PAGE_SIZE - 1) / PAGE_SIZE).max(1) as i32;
+            ui.set_page(((rank as i32 - 1).max(0)) / PAGE_SIZE as i32);
+            ui.set_page_count(pages);
+            refresh_entries(&ui, &db, &project);
+            ui.set_sel_id(id);
+            load_entry_detail(&ui, &db, &ui.get_sel_id().to_string());
+            ui.set_qa_visible(false);
+        });
+    }
+
+    // --- Find & Replace (translations only)
+    {
+        let weak = ui.as_weak();
+        ui.on_fr_open(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.get_running() {
+                return;
+            }
+            let find = ui.get_entry_search().trim().to_string();
+            if !find.is_empty() {
+                ui.set_fr_find(find.into());
+            }
+            ui.set_fr_case(ui.get_entry_search_case());
+            ui.set_fr_word(ui.get_entry_search_word());
+            ui.set_fr_count("".into());
+            ui.set_fr_preview(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
+            ui.set_fr_visible(true);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_fr_preview_run(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            let (total, previews) = match fr_compute(&ui, &db, &project) {
+                Ok(v) => v,
+                Err(e) => {
+                    ui.set_fr_count(format!("Invalid search: {e:#}").into());
+                    return;
+                }
+            };
+            let rows: Vec<SharedString> = previews
+                .into_iter()
+                .map(|(old, new)| SharedString::from(format!("{old}  →  {new}")))
+                .collect();
+            ui.set_fr_count(
+                format!("{total} translations match — showing the first {}", rows.len()).into(),
+            );
+            ui.set_fr_preview(ModelRc::from(Rc::new(VecModel::from(rows))));
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_fr_replace_all(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(project) = current_project(&db) else { return };
+            let find = ui.get_fr_find().trim().to_string();
+            if find.is_empty() {
+                ui.set_fr_count("Enter text to find first.".into());
+                return;
+            }
+            let Ok(re) = fr_build_regex(&find, ui.get_fr_case(), ui.get_fr_word()) else {
+                ui.set_fr_count("Invalid search text.".into());
+                return;
+            };
+            let replace = ui.get_fr_replace().to_string();
+            let Some(engine) = engine_for(&project) else { return };
+            let entries = db.all_entries(&project.id).unwrap_or_default();
+            let mut updates: Vec<(String, String)> = Vec::new();
+            let mut skipped = 0;
+            for e in entries {
+                let Some(text) = e.translated_text.as_deref() else { continue };
+                if !re.is_match(text) {
+                    continue;
+                }
+                let new_text = fr_replace_text(text, &re, &replace);
+                if new_text == text {
+                    continue;
+                }
+                // Never let a replacement destroy protected tokens.
+                let tokens = engine.protected_tokens(&e.source.source_text);
+                let lowered = new_text.to_lowercase();
+                if tokens
+                    .iter()
+                    .any(|t| !lowered.contains(&t.to_lowercase()))
+                {
+                    skipped += 1;
+                    continue;
+                }
+                updates.push((e.source.id.clone(), new_text));
+            }
+            match db.translations_replace_texts(&updates) {
+                Ok(()) => {
+                    ui.set_fr_visible(false);
+                    if let Some(project) = current_project(&db) {
+                        refresh_entries(&ui, &db, &project);
+                    }
+                    ui.set_status_message(
+                        format!(
+                            "Replaced in {} translations{}.",
+                            updates.len(),
+                            if skipped > 0 {
+                                format!(", skipped {skipped} (would lose protected tokens)")
+                            } else {
+                                String::new()
+                            }
+                        )
+                        .into(),
+                    );
+                }
+                Err(e) => ui.set_fr_count(format!("Replace failed: {e:#}").into()),
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_fr_cancel(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_fr_visible(false);
+            }
         });
     }
 
