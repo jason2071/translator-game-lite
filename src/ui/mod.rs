@@ -86,28 +86,69 @@ fn refresh_stats(ui: &AppWindow, db: &Db, project: &Project) -> Result<()> {
 }
 
 fn refresh_entries(ui: &AppWindow, db: &Db, project: &Project) {
-    let page = ui.get_page().clamp(0, ui.get_page_count().saturating_sub(1)) as usize;
-    ui.set_page(page as i32);
-    let rows = db
-        .sources_page(&project.id, page * PAGE_SIZE, PAGE_SIZE)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|e| EntryRow {
-            id: e.source.id.into(),
-            original: e.source.source_text.into(),
-            // Older rows may contain stray spaces from early runs —
-            // normalize for display.
-            translation: e
-                .translated_text
-                .map(|t| crate::core::source::clean_spaces(&t))
-                .unwrap_or_default()
-                .into(),
-            speaker: e.source.speaker.unwrap_or_default().into(),
-            status: e.status.as_str().into(),
-            file: format!("{}:{}", e.source.file_path, e.source.line).into(),
-        })
-        .collect::<Vec<_>>();
+    let term = ui.get_entry_search().trim().to_string();
+    // One page of rows plus the total the page counter should show.
+    // With an active search the filter runs in Rust (for match-case /
+    // whole-word support), producing an id list paginated here.
+    let (rows, total) = if term.is_empty() {
+        let total = db.stats(&project.id).map(|s| s.total as usize).unwrap_or(0);
+        let pages = ((total + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
+        let page = (ui.get_page() as usize).min(pages - 1);
+        ui.set_page(page as i32);
+        let rows = db
+            .sources_page(&project.id, page * PAGE_SIZE, PAGE_SIZE)
+            .unwrap_or_default();
+        (rows, total)
+    } else {
+        let ids = db.search_entry_ids(
+            &project.id,
+            &term,
+            ui.get_entry_search_case(),
+            ui.get_entry_search_word(),
+        );
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[search] term={:?} case={} word={} ids={:?}",
+            term,
+            ui.get_entry_search_case(),
+            ui.get_entry_search_word(),
+            ids.as_ref().map(|v| v.len())
+        );
+        let ids = ids.unwrap_or_default();
+        let total = ids.len();
+        let pages = ((total + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
+        let page = (ui.get_page() as usize).min(pages - 1);
+        ui.set_page(page as i32);
+        let slice: Vec<String> = ids
+            .iter()
+            .skip(page * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .cloned()
+            .collect();
+        (db.entries_by_ids(&slice).unwrap_or_default(), total)
+    };
+    let pages = ((total + PAGE_SIZE - 1) / PAGE_SIZE).max(1) as i32;
+    ui.set_page_count(pages);
+    let rows = rows.into_iter().map(entry_to_row).collect::<Vec<_>>();
     ui.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+fn entry_to_row(e: crate::core::translation::TranslationEntry) -> EntryRow {
+    EntryRow {
+        id: e.source.id.into(),
+        original: e.source.source_text.into(),
+        // Older rows may contain stray spaces from early runs —
+        // normalize for display.
+        translation: e
+            .translated_text
+            .as_deref()
+            .map(crate::core::source::clean_spaces)
+            .unwrap_or_default()
+            .into(),
+        speaker: e.source.speaker.unwrap_or_default().into(),
+        status: e.status.as_str().into(),
+        file: format!("{}:{}", e.source.file_path, e.source.line).into(),
+    }
 }
 
 fn refresh_glossary(ui: &AppWindow, db: &Db) {
@@ -1453,6 +1494,17 @@ fn wire_app_callbacks(ui: &AppWindow, db: Arc<Db>, cancel: Arc<AtomicBool>) {
             let Some(ui) = weak.upgrade() else { return };
             ui.set_glossary_search(text);
             refresh_glossary(&ui, &db);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let db = db.clone();
+        ui.on_apply_entry_search(move |_text| {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_page(0);
+            if let Some(project) = current_project(&db) {
+                refresh_entries(&ui, &db, &project);
+            }
         });
     }
 }

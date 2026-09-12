@@ -296,6 +296,90 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// Entries by explicit ids (a slice of search results), in file/line
+    /// order.
+    pub fn entries_by_ids(&self, ids: &[String]) -> Result<Vec<TranslationEntry>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT s.id, s.engine_id, s.file_path, s.line, s.speaker, s.source_text, s.source_hash, s.context,
+                    t.translated_text, t.status, t.updated_at
+             FROM sources s LEFT JOIN translations t ON t.source_id = s.id
+             WHERE s.id IN ({placeholders})
+             ORDER BY s.file_path, s.line"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), row_to_translation_entry)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Ids (file/line order) of entries whose source text OR translation
+    /// matches `term`. Case-insensitive by default; `whole_word` treats any
+    /// non-word character as a boundary (word chars are ASCII
+    /// [A-Za-z0-9_], so it applies to Latin terms).
+    pub fn search_entry_ids(
+        &self,
+        project_id: &str,
+        term: &str,
+        match_case: bool,
+        whole_word: bool,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.source_text, t.translated_text
+             FROM sources s LEFT JOIN translations t ON t.source_id = s.id
+             WHERE s.project_id = ?1
+             ORDER BY s.file_path, s.line",
+        )?;
+        let rows = stmt
+            .query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // The regex crate has no look-around, so the whole-word boundary
+        // consumes one character — irrelevant for boolean matching.
+        let escaped = regex::escape(term.trim());
+        let mut pattern = String::new();
+        if !match_case {
+            pattern.push_str("(?i)");
+        }
+        if whole_word {
+            pattern.push_str(&format!("(?:^|\\W){}(?:$|\\W)", escaped));
+        } else {
+            pattern.push_str(&escaped);
+        }
+        let re = regex::Regex::new(&pattern)?;
+
+        let matched: Vec<String> = rows
+            .into_iter()
+            .filter(|(_, source, translation)| {
+                re.is_match(source)
+                    || translation
+                        .as_deref()
+                        .map(|t| re.is_match(t))
+                        .unwrap_or(false)
+            })
+            .map(|(id, _, _)| id)
+            .collect();
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[search] pattern={:?} matched={}",
+            pattern,
+            matched.len()
+        );
+        Ok(matched)
+    }
+
     /// Entries eligible for automatic translation (Pending or Failed).
     pub fn pending_entries(&self, project_id: &str) -> Result<Vec<TranslationEntry>> {
         let conn = self.conn.lock().unwrap();
@@ -1102,6 +1186,52 @@ mod tests {
             (stats.total, stats.translated, stats.pending, stats.failed),
             (10, 1, 8, 1)
         );
+    }
+
+    #[test]
+    fn entry_search_respects_case_and_word_flags() {
+        let d = db();
+        let p = d.project_upsert(&project()).unwrap();
+        let sources: Vec<SourceEntry> = vec![
+            source("script.rpy|1", "Miss Jones smiles", 1),
+            source("script.rpy|2", "miss jones laughs", 2),
+            source("script.rpy|3", "Jonesy waves", 3),
+            source("script.rpy|4", "hello there", 4),
+        ];
+        d.scan_apply(&p, &ExtractionResult { sources, existing_translations: vec![] })
+            .unwrap();
+        // Row 4 matches only via its translation column.
+        d.set_translation(
+            &format!("{}|script.rpy|4", p.id),
+            Some("สวัสดี Jones จ้า"),
+            TranslationStatus::Translated,
+        )
+        .unwrap();
+
+        // Substring, case-insensitive: rows 1, 2, 3 (source) and 4 (translation).
+        let ids = d.search_entry_ids(&p.id, "jones", false, false).unwrap();
+        assert_eq!(ids.len(), 4);
+
+        // Match case: row 2 (all lowercase) drops out.
+        let ids = d.search_entry_ids(&p.id, "Jones", true, false).unwrap();
+        assert_eq!(ids.len(), 3);
+
+        // Whole word: "Jonesy" (row 3) drops out, boundaries still match.
+        let ids = d.search_entry_ids(&p.id, "jones", false, true).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| !id.ends_with("|3")));
+
+        // Whole word + match case: only exact "Jones" tokens remain.
+        let ids = d.search_entry_ids(&p.id, "Jones", true, true).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().any(|id| id.ends_with("|1")));
+        assert!(ids.iter().any(|id| id.ends_with("|4")));
+
+        // Entries can be fetched back in file/line order by id.
+        let rows = d.entries_by_ids(&ids).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].source.line, 1);
+        assert_eq!(rows[1].source.line, 4);
     }
 
     #[test]

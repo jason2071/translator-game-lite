@@ -274,6 +274,9 @@ export component AppWindow inherits Window {
     in-out property <string> sel-translation;
     in property <string> sel-glossary-hint;
     in property <ContextInfo> sel-context;
+    in-out property <string> entry-search;
+    in-out property <bool> entry-search-case; // match case
+    in-out property <bool> entry-search-word; // match whole word
 
     // ---- glossary
     in property <[GlossaryRow]> glossary;
@@ -348,6 +351,7 @@ export component AppWindow inherits Window {
     callback glossary-delete(string);
     callback glossary-toggle(string, bool);
     callback apply-glossary-search(string);
+    callback apply-entry-search(string);
     callback profile-edit(string);
     callback profile-delete(string);
     callback profile-add();
@@ -432,6 +436,25 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         horizontal-stretch: 3;
                         spacing: 6px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            LineEdit {
+                                placeholder-text: "Search original / translation...";
+                                text <=> root.entry-search;
+                                horizontal-stretch: 1;
+                                edited(text) => { root.apply-entry-search(text); }
+                            }
+                            CheckBox {
+                                text: "Match case";
+                                checked <=> root.entry-search-case;
+                                toggled => { root.apply-entry-search(root.entry-search); }
+                            }
+                            CheckBox {
+                                text: "Whole word";
+                                checked <=> root.entry-search-word;
+                                toggled => { root.apply-entry-search(root.entry-search); }
+                            }
+                        }
                         // Header + row delegates MUST use the same column math.
                         // A HorizontalLayout distributes space by stretch *plus*
                         // each label's min text width, which drifts a few px from
