@@ -435,7 +435,7 @@ export component AppWindow inherits Window {
                 read-only: true;
                 min-width: 260px;
             }
-            Button { text: "Open..."; clicked => { root.browse-project(); } }
+            Button { text: "Open"; clicked => { root.browse-project(); } }
             Button { text: "Scan"; enabled: root.project-path != ""; clicked => { root.scan-project(); } }
             Rectangle { horizontal-stretch: 1; }
             Button { text: "Project"; clicked => { root.current-tab = 0; } }
@@ -488,7 +488,7 @@ export component AppWindow inherits Window {
                                 selected(text) => { root.apply-entry-search(root.entry-search); }
                             }
                             LineEdit {
-                                placeholder-text: "Search original / translation...";
+                                placeholder-text: "Search original / translation";
                                 text <=> root.entry-search;
                                 horizontal-stretch: 1;
                                 edited(text) => { root.apply-entry-search(text); }
@@ -504,7 +504,7 @@ export component AppWindow inherits Window {
                                 toggled => { root.apply-entry-search(root.entry-search); }
                             }
                             Button {
-                                text: "Replace…";
+                                text: "Replace";
                                 clicked => { root.fr-open(); }
                             }
                         }
@@ -695,13 +695,13 @@ export component AppWindow inherits Window {
                         selected(text) => { root.pick-translation-profile(text); }
                     }
                     if !root.running : Button {
-                        text: "Translate pending";
+                        text: "Translate";
                         primary: true;
                         enabled: root.project-path != "";
                         clicked => { root.start-translate(); }
                     }
                     if !root.running : Button {
-                        text: "Re-translate…";
+                        text: "Re-translate";
                         enabled: root.project-path != "";
                         clicked => { root.retranslate-open(); }
                     }
@@ -733,7 +733,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 8px;
                     LineEdit {
-                        placeholder-text: "Search glossary...";
+                        placeholder-text: "Search glossary";
                         text <=> root.glossary-search;
                         min-width: 240px;
                         edited(text) => { root.apply-glossary-search(text); }

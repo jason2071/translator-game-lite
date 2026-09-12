@@ -342,8 +342,9 @@ impl Db {
     }
 
     /// Mark translations back to Pending so the next run re-translates
-    /// them. `None` = every entry of the project; `Some(ids)` = exactly
-    /// those entries. Returns the number of rows reset.
+    /// them, clearing the old text (same as single-entry re-translate).
+    /// `None` = every entry of the project; `Some(ids)` = exactly those
+    /// entries. Returns the number of rows reset.
     pub fn translations_reset_pending(
         &self,
         project_id: &str,
@@ -356,14 +357,16 @@ impl Db {
         match ids {
             None => {
                 n = tx.execute(
-                    "UPDATE translations SET status = 'pending', updated_at = ?2
+                    "UPDATE translations
+                     SET status = 'pending', translated_text = NULL, updated_at = ?2
                      WHERE source_id IN (SELECT id FROM sources WHERE project_id = ?1)",
                     params![project_id, now],
                 )?;
             }
             Some(ids) => {
                 let mut stmt = tx.prepare(
-                    "UPDATE translations SET status = 'pending', updated_at = ?2
+                    "UPDATE translations
+                     SET status = 'pending', translated_text = NULL, updated_at = ?2
                      WHERE source_id = ?1",
                 )?;
                 for id in ids {
@@ -1302,12 +1305,19 @@ mod tests {
         );
 
         // Bulk re-translate reset: every translations row (scan_apply
-        // pre-creates one per entry) goes back to pending.
+        // pre-creates one per entry) goes back to pending and the old
+        // text is cleared.
         let reset = d
             .translations_reset_pending(&p.id, None)
             .unwrap();
         assert_eq!(reset, 10);
         assert_eq!(d.pending_entries(&p.id).unwrap().len(), 10);
+        assert!(d
+            .source_by_id(&format!("{}|script.rpy|1", p.id))
+            .unwrap()
+            .unwrap()
+            .translated_text
+            .is_none());
 
         // Scope by ids resets just those entries.
         d.set_translation(

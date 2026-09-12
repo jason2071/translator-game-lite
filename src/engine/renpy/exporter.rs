@@ -105,6 +105,35 @@ fn export_virtual(
 
     let mut files_written = 0usize;
     let mut entries_written = 0usize;
+    let dir = game_root.join("tl").join(&language);
+    std::fs::create_dir_all(&dir)?;
+
+    // Ren'Py aborts at load time when two files declare the same `old`
+    // string for one language. Collect everything already claimed by
+    // sibling files (e.g. tl/None/common.rpym) so those strings are
+    // skipped below.
+    let mut claimed: std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !(name.ends_with(".rpy") || name.ends_with(".rpym")) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(e.path()) {
+                let olds: std::collections::HashSet<String> = parse_old_new_pairs(&content)
+                    .into_iter()
+                    .map(|(old, _)| old)
+                    .collect();
+                claimed.insert(e.path(), olds);
+            }
+        }
+    }
+    // Olds written for earlier archives in this same run also count.
+    let mut runtime_taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for (archive, list) in by_archive {
         // One translation per original string; the lowest line wins.
         let mut wanted: std::collections::BTreeMap<String, &str> =
@@ -121,15 +150,23 @@ fn export_virtual(
         }
 
         let stem = archive.strip_suffix(".rpa").unwrap_or(archive);
-        let dir = game_root.join("tl").join(&language);
-        std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}_gtl.rpy", sanitize_dir_name(stem)));
+        let taken: std::collections::HashSet<String> = claimed
+            .iter()
+            .filter(|(p, _)| *p != &path)
+            .flat_map(|(_, olds)| olds.iter().cloned())
+            .chain(runtime_taken.iter().cloned())
+            .collect();
 
         // Existing pairs keep their order; ones we supply are updated in
-        // place, everything else is appended.
+        // place, everything else is appended. Pairs claimed by sibling
+        // files are dropped — they would crash the game on load.
         let mut pairs: Vec<(String, String)> = Vec::new();
         if let Ok(existing) = std::fs::read_to_string(&path) {
             for (old, new) in parse_old_new_pairs(&existing) {
+                if taken.contains(&old) {
+                    continue;
+                }
                 let new = match wanted.get(&old) {
                     Some(ours) => (*ours).to_string(),
                     None => new.unwrap_or_default(),
@@ -138,9 +175,13 @@ fn export_virtual(
             }
         }
         for (old, new) in &wanted {
-            if !pairs.iter().any(|(o, _)| o == old) {
-                pairs.push((old.clone(), (*new).to_string()));
+            if taken.contains(old) || pairs.iter().any(|(o, _)| o == old) {
+                continue;
             }
+            pairs.push((old.clone(), (*new).to_string()));
+        }
+        for (old, _) in &pairs {
+            runtime_taken.insert(old.clone());
         }
 
         let mut out = String::new();
@@ -553,5 +594,55 @@ mod tests {
         );
         // The language-named folder must not be created in this mode.
         assert!(!root.join("tl/Thai").exists());
+    }
+
+    #[test]
+    fn skips_strings_already_translated_by_sibling_files() {
+        let root = temp_root("rp.dup");
+        let none = root.join("tl/None");
+        fs::create_dir_all(&none).unwrap();
+        fs::write(
+            none.join("common.rpym"),
+            "translate None strings:\n\n    old \"Are you sure?\"\n    new \"Are you sure?\"\n",
+        )
+        .unwrap();
+
+        export(
+            &root,
+            &[
+                entry("archive.rpa!s.rpy", 1, "Are you sure?", "คุณแน่ใจนะ"),
+                entry("archive.rpa!s.rpy", 2, "Brand new", "ใหม่"),
+            ],
+            "Thai",
+            true,
+        )
+        .unwrap();
+
+        let out = fs::read_to_string(none.join("archive_gtl.rpy")).unwrap();
+        assert!(out.contains("Brand new"), "{out}");
+        // The conflicting string must be dropped, or Ren'Py aborts on load.
+        assert!(!out.contains("Are you sure?"), "{out}");
+    }
+
+    #[test]
+    fn duplicate_strings_across_archives_are_written_once() {
+        let root = temp_root("rp.cross");
+        export(
+            &root,
+            &[
+                entry("a.rpa!s.rpy", 1, "Same line", "เหมือนกัน"),
+                entry("b.rpa!t.rpy", 1, "Same line", "เหมือนกัน"),
+            ],
+            "Thai",
+            false,
+        )
+        .unwrap();
+
+        // Both gtl files exist (one per archive), but the second must not
+        // re-declare the shared string.
+        let a = fs::read_to_string(root.join("tl/Thai/a_gtl.rpy")).unwrap();
+        let b = fs::read_to_string(root.join("tl/Thai/b_gtl.rpy")).unwrap();
+        assert!(a.contains("Same line"));
+        assert!(!b.contains("Same line"), "{b}");
     }
 }
